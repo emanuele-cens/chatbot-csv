@@ -1,232 +1,380 @@
+import os
 import re
-from pathlib import Path
-import pandas as pd
+import html
+import time
+import requests
 import streamlit as st
+import xml.etree.ElementTree as ET
+
+from bs4 import BeautifulSoup
 from openai import OpenAI
 
-BASE_DIR = Path(__file__).resolve().parent
-CSV_FILE = BASE_DIR / "prodotti.csv"
-KNOWLEDGE_FILE = BASE_DIR / "knowledge.txt"
+# =========================
+# CONFIG
+# =========================
+SITEMAP_URL = "https://www.mgfishing.eu/1_index_sitemap.xml"
+SITE_DOMAIN = "www.mgfishing.eu"
+DEFAULT_MODEL = "gpt-5-mini"
 
-st.set_page_config(page_title="Assistente MGFishing", page_icon="🎣", layout="wide")
+REQUEST_TIMEOUT = 20
+MAX_URLS_TO_INDEX = 120
+MAX_PAGES_FOR_CONTEXT = 6
+MAX_CHARS_PER_PAGE = 5000
 
-st.title("🎣 Assistente MGFishing")
-st.write(
-    "Benvenuto. Chiedimi pure informazioni sui prodotti, sulle spedizioni, "
-    "sul tracking, sui resi, sull'assistenza e anche consigli tecnici di pesca."
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; MGFishingBot/1.0; +https://www.mgfishing.eu)"
 )
 
-API_KEY = st.secrets["OPENAI_API_KEY"]
+# =========================
+# PAGE CONFIG
+# =========================
+st.set_page_config(
+    page_title="Assistente MGFishing",
+    page_icon="🎣",
+    layout="wide",
+)
 
+st.title("🎣 Assistente MGFishing")
+st.caption("Risposte basate sui contenuti del sito MGFishing")
 
-def safe_str(value):
-    if pd.isna(value):
-        return ""
-    return str(value)
+# =========================
+# OPENAI CLIENT
+# =========================
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 
+if not api_key:
+    st.error("Manca la OPENAI_API_KEY. Inseriscila nei secrets di Streamlit oppure nelle variabili ambiente.")
+    st.stop()
 
-def row_to_text(row):
-    parts = []
-    for col in row.index:
-        val = safe_str(row[col]).strip()
-        if val:
-            parts.append(f"{col}: {val}")
-    return " | ".join(parts)
+client = OpenAI(api_key=api_key)
 
-
-def search_relevant_rows(df, question, top_n=20):
-    words = [w.strip().lower() for w in question.split() if w.strip()]
-    results = []
-
-    for idx, row in df.iterrows():
-        text = row_to_text(row).lower()
-        score = 0
-        for word in words:
-            if word in text:
-                score += 1
-        if score > 0:
-            results.append((score, idx, row))
-
-    results.sort(key=lambda x: x[0], reverse=True)
-
-    if not results:
-        fallback = []
-        for idx, row in df.head(top_n).iterrows():
-            fallback.append((0, idx, row))
-        return fallback
-
-    return results[:top_n]
-
-
-def load_knowledge_file():
-    if KNOWLEDGE_FILE.exists():
-        with open(KNOWLEDGE_FILE, "r", encoding="utf-8") as f:
-            return f.read()
-    return ""
-
-
-def make_links_clickable(text):
-    if not text:
-        return text
-
-    text = re.sub(
-        r"\[([^\]]+)\]\((https?://[^\)]+)\)",
-        r'<a href="\2" target="_blank">\1</a>',
-        text,
-    )
-
-    text = re.sub(
-        r"(https://wa\.me/\d+)",
-        r'<a href="\1" target="_blank">\1</a>',
-        text,
-    )
-
+# =========================
+# HELPERS
+# =========================
+def normalize_text(text: str) -> str:
+    text = html.unescape(text or "")
+    text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def is_product_question(question):
-    q = question.lower()
-    product_keywords = [
-        "prodotto", "prodotti", "mulinello", "mulinelli", "canna", "canne", "filo", "trecciato",
-        "articolo", "articoli", "categoria", "prezzo", "marca", "disponibile", "disponibilità",
-        "codice", "sku", "shimano", "daiwa", "trabucco", "colmic", "rapture", "yuki", "molix",
-        "catalogo"
+def clean_page_text(raw_html: str) -> tuple[str, str]:
+    soup = BeautifulSoup(raw_html, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
+        tag.decompose()
+
+    title = ""
+    if soup.title and soup.title.text:
+        title = normalize_text(soup.title.text)
+
+    # Prova a prendere contenuto più utile
+    candidates = []
+
+    selectors = [
+        "main",
+        "#content",
+        ".page-content",
+        ".product-information",
+        ".product-description",
+        ".cms",
+        "article",
+        "body",
     ]
-    return any(keyword in q for keyword in product_keywords)
+
+    for sel in selectors:
+        found = soup.select_one(sel)
+        if found:
+            candidates.append(found.get_text(" ", strip=True))
+
+    text = max(candidates, key=len) if candidates else soup.get_text(" ", strip=True)
+    text = normalize_text(text)
+
+    return title, text
 
 
-def is_store_info_question(question):
-    q = question.lower()
-    store_keywords = [
-        "spedizione", "spedizioni", "tracking", "reso", "resi", "pagamento", "pagamenti",
-        "whatsapp", "assistenza", "contatti", "contatto", "ordine", "ordini", "corriere",
-        "consegna", "consegne", "tempo di spedizione", "tempi di spedizione", "costo spedizione",
-        "costi di spedizione", "poste italiane", "sda", "bartolini", "tnt", "fedex", "ups",
-        "numero", "telefono", "supporto"
+def get_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    return session
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_xml(url: str) -> bytes:
+    session = get_session()
+    r = session.get(url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.content
+
+
+def parse_sitemap_recursive(url: str, collected: list[str] | None = None) -> list[str]:
+    if collected is None:
+        collected = []
+
+    content = fetch_xml(url)
+
+    try:
+        root = ET.fromstring(content)
+    except Exception:
+        return collected
+
+    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+    # sitemap index
+    sitemap_tags = root.findall(".//sm:sitemap/sm:loc", ns)
+    if sitemap_tags:
+        for loc in sitemap_tags:
+            child_url = (loc.text or "").strip()
+            if child_url:
+                parse_sitemap_recursive(child_url, collected)
+        return collected
+
+    # urlset
+    url_tags = root.findall(".//sm:url/sm:loc", ns)
+    for loc in url_tags:
+        page_url = (loc.text or "").strip()
+        if page_url and SITE_DOMAIN in page_url:
+            collected.append(page_url)
+
+    return collected
+
+
+def is_useful_url(url: str) -> bool:
+    blocked_patterns = [
+        "/login",
+        "/autenticazione",
+        "/order",
+        "/carrello",
+        "/checkout",
+        "/password",
+        "/quick-order",
+        "/guest-tracking",
+        "/module/",
+        "controller=authentication",
+        "controller=order",
+        "controller=cart",
     ]
-    return any(keyword in q for keyword in store_keywords)
+    low_value_extensions = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".pdf", ".xml"]
+
+    lower = url.lower()
+
+    if any(lower.endswith(ext) for ext in low_value_extensions):
+        return False
+
+    if any(pat in lower for pat in blocked_patterns):
+        return False
+
+    return True
 
 
-def is_fishing_advice_question(question):
-    q = question.lower()
-    advice_keywords = [
-        "montatura", "montature", "finale", "finali", "trave", "bracciolo", "terminale", "terminali",
-        "spot", "spiaggia", "foce", "porto", "scogliera", "lago", "torrente", "fiume",
-        "tecnica", "tecniche", "esca", "esche", "artificiale", "artificiali",
-        "come pescare", "come prendere", "come insidiare", "preda", "pesce",
-        "orata", "spigola", "serra", "cefalo", "trota", "carpa", "palamita", "alletterato",
-        "mare mosso", "acqua torbida", "acqua velata", "vento", "stagione", "marea",
-        "consiglio", "consigli", "assetto", "diametro", "amo", "ami", "galleggiante",
-        "bombarda", "feeder", "surfcasting", "spinning", "bolognese", "trout area"
-    ]
-    return any(keyword in q for keyword in advice_keywords)
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_page(url: str) -> dict:
+    session = get_session()
+    r = session.get(url, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+
+    title, text = clean_page_text(r.text)
+
+    return {
+        "url": url,
+        "title": title,
+        "text": text[:MAX_CHARS_PER_PAGE],
+    }
 
 
+@st.cache_data(show_spinner=True, ttl=3600)
+def build_knowledge_base(sitemap_url: str, max_urls: int) -> list[dict]:
+    all_urls = parse_sitemap_recursive(sitemap_url)
+    seen = set()
+    cleaned_urls = []
+
+    for url in all_urls:
+        if url not in seen and is_useful_url(url):
+            seen.add(url)
+            cleaned_urls.append(url)
+
+    cleaned_urls = cleaned_urls[:max_urls]
+
+    docs = []
+    for idx, url in enumerate(cleaned_urls, start=1):
+        try:
+            doc = fetch_page(url)
+            if doc["text"] and len(doc["text"]) > 150:
+                docs.append(doc)
+        except Exception:
+            continue
+
+        # piccolo respiro per non stressare il sito
+        time.sleep(0.05)
+
+    return docs
+
+
+def tokenize(text: str) -> list[str]:
+    text = (text or "").lower()
+    text = re.sub(r"[^a-z0-9àèéìòù]+", " ", text)
+    return [t for t in text.split() if len(t) > 1]
+
+
+def score_document(query: str, doc: dict) -> int:
+    query_tokens = tokenize(query)
+    if not query_tokens:
+        return 0
+
+    haystack_title = (doc.get("title") or "").lower()
+    haystack_text = (doc.get("text") or "").lower()
+    haystack_url = (doc.get("url") or "").lower()
+
+    score = 0
+    for token in query_tokens:
+        score += haystack_title.count(token) * 8
+        score += haystack_url.count(token) * 6
+        score += haystack_text.count(token) * 2
+
+    # bonus per query composta
+    joined_query = " ".join(query_tokens)
+    if joined_query and joined_query in haystack_text:
+        score += 20
+
+    return score
+
+
+def retrieve_relevant_docs(query: str, docs: list[dict], top_k: int = MAX_PAGES_FOR_CONTEXT) -> list[dict]:
+    scored = []
+    for doc in docs:
+        s = score_document(query, doc)
+        if s > 0:
+            scored.append((s, doc))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in scored[:top_k]]
+
+
+def build_context_snippets(docs: list[dict]) -> str:
+    blocks = []
+    for i, doc in enumerate(docs, start=1):
+        block = (
+            f"[FONTE {i}]\n"
+            f"URL: {doc['url']}\n"
+            f"TITOLO: {doc['title']}\n"
+            f"CONTENUTO:\n{doc['text']}\n"
+        )
+        blocks.append(block)
+    return "\n\n".join(blocks)
+
+
+def ask_openai(question: str, context: str, model: str) -> str:
+    system_prompt = """
+Sei l'assistente ecommerce di MGFishing.
+Rispondi in italiano.
+Usa solo le informazioni presenti nel CONTEXTO del sito.
+Se il contesto non contiene abbastanza informazioni, dillo chiaramente.
+Non inventare disponibilità, prezzi, misure o caratteristiche.
+Se utile, suggerisci di visitare la pagina prodotto citando il link presente nel contesto.
+Mantieni risposte chiare, commerciali e utili al cliente finale.
+"""
+
+    user_prompt = f"""
+CONTEXTO DEL SITO:
+{context}
+
+DOMANDA UTENTE:
+{question}
+
+ISTRUZIONI:
+- Rispondi solo con dati supportati dal contesto.
+- Se ci sono più prodotti o link utili, elencali in modo chiaro.
+- Se non trovi abbastanza informazioni, scrivi che non hai trovato dati sufficienti nel sito.
+"""
+
+    response = client.responses.create(
+        model=model,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+
+    return (response.output_text or "").strip()
+
+
+# =========================
+# SIDEBAR
+# =========================
+with st.sidebar:
+    st.header("Impostazioni")
+
+    sitemap_url = st.text_input("Sitemap URL", value=SITEMAP_URL)
+    model_name = st.text_input("Modello OpenAI", value=DEFAULT_MODEL)
+    max_urls = st.slider("Numero massimo pagine da indicizzare", 20, 200, MAX_URLS_TO_INDEX, 10)
+
+    if st.button("🔄 Aggiorna indicizzazione"):
+        st.cache_data.clear()
+        st.success("Cache svuotata. Alla prossima domanda ricarico tutto.")
+
+    st.markdown("---")
+    st.write("Consiglio iniziale:")
+    st.write("- prova con 60-120 pagine")
+    st.write("- poi aumenta solo se serve")
+
+
+# =========================
+# LOAD KNOWLEDGE BASE
+# =========================
+with st.spinner("Sto leggendo la sitemap e preparando il contenuto del sito..."):
+    try:
+        docs = build_knowledge_base(sitemap_url, max_urls)
+    except Exception as e:
+        st.error(f"Errore durante la lettura della sitemap: {e}")
+        st.stop()
+
+st.success(f"Indicizzazione pronta: {len(docs)} pagine lette")
+
+# =========================
+# CHAT STATE
+# =========================
 if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if not CSV_FILE.exists():
-    st.error("File prodotti.csv non trovato nella cartella del progetto.")
-    st.stop()
-
-knowledge_text = load_knowledge_file()
-if not knowledge_text:
-    st.warning("knowledge.txt non trovato o vuoto.")
-
-try:
-    df = pd.read_csv(CSV_FILE, sep=";", engine="python")
-except Exception as e:
-    st.error(f"Errore nella lettura di prodotti.csv: {e}")
-    st.stop()
-
-client = OpenAI(api_key=API_KEY)
+    st.session_state.messages = [
+        {
+            "role": "assistant",
+            "content": "Ciao, sono l'assistente MGFishing. Chiedimi informazioni sui prodotti presenti sul sito.",
+        }
+    ]
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        if msg["role"] == "assistant":
-            rendered = make_links_clickable(msg["content"])
-            st.markdown(rendered, unsafe_allow_html=True)
-        else:
-            st.markdown(msg["content"])
+        st.write(msg["content"])
 
-question = st.chat_input("Scrivi qui la tua domanda")
+# =========================
+# USER INPUT
+# =========================
+question = st.chat_input("Scrivi qui la tua domanda...")
 
 if question:
     st.session_state.messages.append({"role": "user", "content": question})
 
     with st.chat_message("user"):
-        st.markdown(question)
-
-    use_products = is_product_question(question)
-    use_store_info = is_store_info_question(question)
-    use_fishing_advice = is_fishing_advice_question(question)
-
-    if not use_products and not use_store_info and not use_fishing_advice:
-        use_products = True
-        use_store_info = True
-        use_fishing_advice = True
-
-    context_text = ""
-
-    if use_products:
-        relevant_rows = search_relevant_rows(df, question, top_n=20)
-        context_lines = []
-        for score, idx, row in relevant_rows:
-            context_lines.append(f"Riga {idx + 1}: {row_to_text(row)}")
-        product_context = "\n".join(context_lines)
-        context_text += f"CONTESTO PRODOTTI (CSV):\n{product_context}\n\n"
-
-    if use_store_info and knowledge_text:
-        context_text += f"CONTESTO NEGOZIO (KNOWLEDGE.TXT):\n{knowledge_text}\n\n"
-
-    system_prompt = (
-        "Sei l'assistente di MGFishing. "
-        "Per prodotti, prezzi, disponibilità e catalogo usa solo il CSV. "
-        "Per spedizioni, tracking, resi, contatti e assistenza usa solo knowledge.txt. "
-        "Per consigli tecnici di pesca, montature, spot, tecniche, stagionalità ed esche puoi usare la ricerca web. "
-        "Non mostrare mai fonti, siti, riferimenti o link esterni al cliente. "
-        "Rispondi sempre in italiano, in modo chiaro, concreto e naturale. "
-        "Non inventare dati del negozio o del catalogo. "
-        "Se è presente un link WhatsApp del negozio, mantienilo cliccabile."
-    )
-
-    user_prompt = f"""
-Domanda utente:
-{question}
-
-Contesto disponibile:
-{context_text}
-
-Istruzioni:
-- Usa il CSV solo per i prodotti.
-- Usa knowledge.txt solo per le informazioni del negozio.
-- Se la domanda è tecnica di pesca, puoi usare la web search.
-- Non mostrare riferimenti esterni.
-- Se consigli prodotti, proponi solo prodotti coerenti con il CSV.
-- Se mancano dati interni del negozio, dillo chiaramente.
-"""
-
-    tools = []
-    if use_fishing_advice:
-        tools.append({"type": "web_search_preview"})
+        st.write(question)
 
     with st.chat_message("assistant"):
-        with st.spinner("Sto leggendo i dati..."):
-            response = client.responses.create(
-                model="gpt-5.4",
-                tools=tools,
-                input=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-            )
-            answer = response.output_text
-            rendered = make_links_clickable(answer)
-            st.markdown(rendered, unsafe_allow_html=True)
+        with st.spinner("Cerco le pagine più utili..."):
+            relevant_docs = retrieve_relevant_docs(question, docs, top_k=MAX_PAGES_FOR_CONTEXT)
 
-    st.session_state.messages.append({"role": "assistant", "content": answer})
-    st.markdown("---")
-st.markdown(
-    "<div style='text-align:center; font-size:12px; color:gray;'>Powered By EMANUELE CENSORI</div>",
-    unsafe_allow_html=True,
-)
+            if not relevant_docs:
+                answer = "Non ho trovato contenuti sufficienti nel sito per rispondere bene a questa domanda."
+                st.write(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
+            else:
+                context = build_context_snippets(relevant_docs)
+
+                try:
+                    answer = ask_openai(question, context, model_name)
+                except Exception as e:
+                    answer = f"Errore nella risposta del modello: {e}"
+
+                st.write(answer)
+
+                with st.expander("Link usati per la risposta"):
+                    for doc in relevant_docs:
+                        st.write(f"- {doc['url']}")
+
+                st.session_state.messages.append({"role": "assistant", "content": answer})

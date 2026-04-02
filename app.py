@@ -523,20 +523,19 @@ def deterministic_link_answer(user_message: str):
 
     if best_product:
         product_score, product = best_product
-
         category_score = best_category[0] if best_category else 0.0
 
-        # Se il prodotto è chiaramente migliore della categoria, restituisco direttamente il prodotto
-        if product_score >= 0.62 or (product_score >= 0.50 and product_score >= category_score + 0.10):
+        # se il prodotto è migliore della categoria, restituisci SEMPRE il prodotto
+        if product_score >= 0.48 and product_score >= category_score:
             return (
-                f"Certo, ecco il link del prodotto:\n\n"
+                f"Certo, ecco il prodotto più coerente che ho trovato:\n\n"
                 f"**{product['title']}**\n"
                 f"{product['url']}"
             )
 
-        # Se ci sono più prodotti plausibili
-        if len(scored_products) >= 2 and product_score >= 0.44:
-            lines = ["Ho trovato più risultati molto simili. Ti lascio quelli più probabili:"]
+        # se ci sono più prodotti plausibili
+        if len(scored_products) >= 2 and product_score >= 0.40:
+            lines = ["Ho trovato questi risultati molto simili:"]
             for score, p in scored_products[:3]:
                 lines.append(f"- **{p['title']}**\n  {p['url']}")
             return "\n\n".join(lines)
@@ -544,16 +543,15 @@ def deterministic_link_answer(user_message: str):
     if best_category and best_category[0] >= 0.58:
         c = best_category[1]
         return (
-            f"Non ho trovato con sufficiente certezza il prodotto esatto, ma questa è la pagina più vicina che ho trovato:\n\n"
+            f"Non ho trovato con certezza il prodotto esatto, ma questa è la pagina più vicina che ho trovato:\n\n"
             f"**{c['title']}**\n"
             f"{c['url']}"
         )
 
     return (
         "Non sono riuscito a identificare con sicurezza il prodotto esatto. "
-        "Scrivimi il nome anche solo in modo un po’ più completo e ti mando il link giusto."
+        "Scrivimi il nome in modo leggermente più completo e ti mando il link corretto."
     )
-
 
 def maybe_add_catalog_links_to_answer(answer: str, user_message: str):
     # Se l'utente non ha chiesto un link, ma possiamo allegare 1-2 prodotti pertinenti, lo facciamo

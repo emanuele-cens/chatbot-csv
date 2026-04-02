@@ -225,3 +225,8 @@ Istruzioni:
             st.markdown(rendered, unsafe_allow_html=True)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})
+    st.markdown("---")
+st.markdown(
+    "<div style='text-align:center; font-size:12px; color:gray;'>Powered By EMANUELE CENSORI</div>",
+    unsafe_allow_html=True,
+)

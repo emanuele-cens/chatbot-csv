@@ -1,6 +1,4 @@
 streamlit
 openai>=1.30.0
 requests
-beautifulsoup4
-duckduckgo-search
-lxml
+rapidfuzz

@@ -1,434 +1,602 @@
 import os
 import re
-import time
 import json
-import html
+import time
+import threading
 import requests
-import streamlit as st
 import xml.etree.ElementTree as ET
 
-from bs4 import BeautifulSoup
-from openai import OpenAI
+from difflib import SequenceMatcher
+from urllib.parse import urlparse, unquote
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-# =========================
+# =========================================================
 # CONFIG
-# =========================
-st.set_page_config(page_title="Assistente MGFishing", page_icon="🎣", layout="wide")
+# =========================================================
 
-CACHE_FILE = "kb_cache.json"
-HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; MGFishingBot/1.0)"}
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
 
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+SITE_URL = "https://www.mgfishing.eu"
+SITEMAP_URL = "https://www.mgfishing.eu/1_index_sitemap.xml"
 
-client = None
-if OPENAI_API_KEY:
-    try:
-        client = OpenAI(api_key=OPENAI_API_KEY)
-    except Exception:
-        client = None
+PRODUCT_CACHE_FILE = "products_cache.json"
+PRODUCT_CACHE_TTL = 60 * 60 * 12  # 12 ore
+AUTO_REFRESH_INTERVAL = 60 * 60 * 6  # refresh automatico ogni 6 ore
 
-# =========================
-# SESSION STATE
-# =========================
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+REQUEST_TIMEOUT = 25
 
-if "knowledge_base" not in st.session_state:
-    st.session_state.knowledge_base = []
+app = Flask(__name__)
+CORS(app)
 
-if "indexed_urls" not in st.session_state:
-    st.session_state.indexed_urls = []
+PRODUCTS = []
+LAST_CATALOG_UPDATE = 0
 
-if "index_ready" not in st.session_state:
-    st.session_state.index_ready = False
 
-# =========================
-# HELPERS
-# =========================
+# =========================================================
+# UTILS TESTO
+# =========================================================
+
 def normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", text.strip().lower())
-
-def is_greeting(text: str) -> bool:
-    t = normalize_text(text)
-    greetings = {
-        "ciao", "salve", "buongiorno", "buonasera", "hey", "ehi",
-        "ciao!", "salve!", "buongiorno!", "buonasera!", "hey!", "ehi!"
-    }
-    return t in greetings
-
-def greeting_response() -> str:
-    return (
-        "Ciao 👋 Sono l'assistente MGFishing.\n\n"
-        "Posso aiutarti a trovare prodotti e informazioni presenti sul sito.\n\n"
-        "Per esempio puoi scrivermi:\n"
-        "- mulinello da surfcasting\n"
-        "- canna da trota lago\n"
-        "- trecciato per spinning\n"
-        "- oppure il nome preciso di un prodotto"
-    )
-
-def is_smalltalk(text: str) -> bool:
-    t = normalize_text(text)
-    return t in {
-        "come stai", "come va", "chi sei", "cosa fai",
-        "mi aiuti", "puoi aiutarmi", "ok", "perfetto",
-        "grazie", "grazie!"
-    }
-
-def smalltalk_response(text: str) -> str:
-    t = normalize_text(text)
-
-    if t in {"come stai", "come va"}:
-        return "Sto bene, grazie 😊 Sono qui per aiutarti a cercare prodotti sul sito MGFishing."
-    if t == "chi sei":
-        return "Sono l'assistente MGFishing e posso aiutarti a trovare prodotti e dettagli presenti sul sito."
-    if t in {"cosa fai", "mi aiuti", "puoi aiutarmi"}:
-        return "Certo 😊 Scrivimi il nome del prodotto oppure la categoria che stai cercando."
-    if t in {"ok", "perfetto"}:
-        return "Perfetto 👍 Scrivimi pure cosa stai cercando."
-    if t in {"grazie", "grazie!"}:
-        return "Di nulla 😊 Scrivimi pure il nome del prodotto o la tipologia che ti interessa."
-
-    return "Scrivimi pure cosa stai cercando sul sito MGFishing."
-
-def fetch_url(url: str, timeout: int = 20) -> str:
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout)
-        r.raise_for_status()
-        return r.text
-    except Exception:
+    if not text:
         return ""
-
-def clean_page_text(html_content: str) -> str:
-    soup = BeautifulSoup(html_content, "html.parser")
-
-    for tag in soup(["script", "style", "noscript", "header", "footer", "svg", "img", "form", "nav"]):
-        tag.decompose()
-
-    text = soup.get_text(separator=" ", strip=True)
-    text = html.unescape(text)
+    text = str(text).lower().strip()
+    text = unquote(text)
+    text = text.replace("-", " ")
+    text = text.replace("_", " ")
+    text = re.sub(r"[^\w\sàèéìòù]", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def parse_sitemap(sitemap_url: str) -> list:
-    xml_text = fetch_url(sitemap_url)
-    if not xml_text:
-        return []
 
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception:
-        return []
+def clean_html(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
+
+def slug_to_title_from_url(url: str) -> str:
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return ""
+
+    last = path.split("/")[-1]
+    last = re.sub(r"\.html?$", "", last, flags=re.IGNORECASE)
+    last = last.replace("-", " ")
+    last = last.replace("_", " ")
+    last = re.sub(r"\s+", " ", last).strip()
+
+    return last.title()
+
+
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, a, b).ratio()
+
+
+# =========================================================
+# SITEMAP / CATALOGO PRODOTTI
+# =========================================================
+
+def is_product_url(url: str) -> bool:
+    u = url.lower().strip()
+
+    if not u.startswith("http"):
+        return False
+
+    excluded_parts = [
+        "/blog",
+        "/content",
+        "/module",
+        "/login",
+        "/my-account",
+        "/cart",
+        "/carrello",
+        "/order",
+        "/checkout",
+        "/search",
+        "/brand",
+        "/manufacturer",
+        "/supplier",
+        "/stores",
+        "/sitemap",
+        "/new-products",
+        "/best-sales",
+        "/prices-drop",
+        "/contatt",
+        "/chi-siamo",
+        "/pagina",
+        "/categoria",
+        "/category",
+    ]
+
+    for part in excluded_parts:
+        if part in u:
+            return False
+
+    path = urlparse(u).path.strip("/")
+
+    if not path:
+        return False
+
+    # Nei PrestaShop i prodotti sono spesso URL .html
+    if ".html" in u:
+        return True
+
+    # fallback: ultimo slug sufficientemente "ricco"
+    last = path.split("/")[-1]
+    if len(last) >= 10 and re.search(r"[a-z]", last):
+        return True
+
+    return False
+
+
+def extract_urls_from_sitemap(sitemap_url: str):
+    response = requests.get(sitemap_url, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+
+    root = ET.fromstring(response.content)
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
     urls = []
+    for loc in root.findall(".//sm:loc", ns):
+        if loc.text:
+            urls.append(loc.text.strip())
 
-    sitemap_nodes = root.findall(".//sm:sitemap/sm:loc", ns)
-    if sitemap_nodes:
-        for node in sitemap_nodes:
-            sub_url = (node.text or "").strip()
-            if sub_url:
-                urls.extend(parse_sitemap(sub_url))
-        return list(dict.fromkeys(urls))
+    return urls
 
-    url_nodes = root.findall(".//sm:url/sm:loc", ns)
-    for node in url_nodes:
-        if node.text:
-            urls.append(node.text.strip())
 
-    return list(dict.fromkeys(urls))
+def load_all_sitemap_urls():
+    try:
+        urls = extract_urls_from_sitemap(SITEMAP_URL)
 
-def filter_useful_urls(urls: list) -> list:
-    blocked_parts = [
-        "/login", "/autenticazione", "/password", "/ordine", "/carrello",
-        "/checkout", "/contattaci", "/guest-tracking", "/module/", "#"
-    ]
+        child_sitemaps = [u for u in urls if u.lower().endswith(".xml")]
+        page_urls = [u for u in urls if not u.lower().endswith(".xml")]
 
-    cleaned = []
+        for child in child_sitemaps:
+            try:
+                sub_urls = extract_urls_from_sitemap(child)
+                page_urls.extend(sub_urls)
+            except Exception as e:
+                print(f"[SITEMAP] Errore sitemap figlia {child}: {e}")
+
+        # deduplica
+        unique = []
+        seen = set()
+        for url in page_urls:
+            if url not in seen:
+                seen.add(url)
+                unique.append(url)
+
+        return unique
+
+    except Exception as e:
+        print(f"[SITEMAP] Errore caricamento sitemap principale: {e}")
+        return []
+
+
+def build_product_catalog():
+    urls = load_all_sitemap_urls()
+    products = []
+    seen = set()
+
     for url in urls:
-        low = url.lower()
-        if "?" in low:
-            continue
-        if any(part in low for part in blocked_parts):
-            continue
-        cleaned.append(url)
-
-    return list(dict.fromkeys(cleaned))
-
-def build_knowledge_base(sitemap_url: str, max_pages: int = 80, progress_bar=None, status_box=None):
-    urls = parse_sitemap(sitemap_url)
-    urls = filter_useful_urls(urls)
-    urls = urls[:max_pages]
-
-    kb = []
-
-    for i, url in enumerate(urls, start=1):
-        if status_box:
-            status_box.info(f"Lettura pagina {i}/{len(urls)}")
-
-        html_content = fetch_url(url)
-        if not html_content:
+        if not is_product_url(url):
             continue
 
-        text = clean_page_text(html_content)
-        if len(text) < 200:
+        title = slug_to_title_from_url(url)
+        normalized_title = normalize_text(title)
+
+        if not normalized_title:
             continue
 
-        title = ""
-        try:
-            soup = BeautifulSoup(html_content, "html.parser")
-            if soup.title and soup.title.string:
-                title = soup.title.string.strip()
-        except Exception:
-            title = ""
+        key = (normalized_title, url)
+        if key in seen:
+            continue
+        seen.add(key)
 
-        kb.append({
-            "url": url,
+        products.append({
             "title": title,
-            "content": text[:12000]
+            "normalized_title": normalized_title,
+            "url": url
         })
 
-        if progress_bar:
-            progress_bar.progress(i / max(len(urls), 1))
+    return products
 
-        time.sleep(0.1)
 
-    return kb, urls
-
-def save_cache(kb: list, urls: list, sitemap_url: str, max_pages: int):
-    data = {
-        "sitemap_url": sitemap_url,
-        "max_pages": max_pages,
-        "knowledge_base": kb,
-        "indexed_urls": urls,
-        "saved_at": time.time()
+def save_product_cache(products):
+    payload = {
+        "timestamp": int(time.time()),
+        "products": products
     }
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+    with open(PRODUCT_CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
 
-def load_cache():
-    if not os.path.exists(CACHE_FILE):
+
+def load_product_cache():
+    if not os.path.exists(PRODUCT_CACHE_FILE):
         return None
 
     try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+        with open(PRODUCT_CACHE_FILE, "r", encoding="utf-8") as f:
+            payload = json.load(f)
 
-def score_page(query: str, page_text: str, page_title: str = "") -> int:
-    q = normalize_text(query)
-    content = normalize_text(page_text)
-    title = normalize_text(page_title)
+        ts = int(payload.get("timestamp", 0))
+        age = int(time.time()) - ts
 
-    words = [w for w in re.findall(r"\w+", q) if len(w) > 2]
-    if not words:
-        return 0
+        if age > PRODUCT_CACHE_TTL:
+            return None
 
-    score = 0
-    for w in words:
-        score += content.count(w)
-        score += title.count(w) * 3
+        products = payload.get("products", [])
+        if not isinstance(products, list):
+            return None
 
-    if q in content:
-        score += 15
-    if q in title:
-        score += 20
+        return products
 
-    return score
-
-def search_relevant_pages(query: str, kb: list, top_k: int = 4) -> list:
-    scored = []
-    for item in kb:
-        score = score_page(query, item.get("content", ""), item.get("title", ""))
-        if score > 0:
-            scored.append((score, item))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [item for _, item in scored[:top_k]]
-
-def build_context_from_pages(pages: list) -> str:
-    chunks = []
-    for i, page in enumerate(pages, start=1):
-        chunks.append(
-            f"Fonte {i}\n"
-            f"Titolo: {page.get('title', '')}\n"
-            f"URL: {page.get('url', '')}\n"
-            f"Contenuto: {page.get('content', '')[:3500]}\n"
-        )
-    return "\n\n".join(chunks)
-
-def fallback_no_results() -> str:
-    return (
-        "Non ho trovato abbastanza informazioni per rispondere con precisione.\n\n"
-        "Prova a scrivere il nome preciso del prodotto oppure una categoria, per esempio:\n"
-        "- mulinello surfcasting\n"
-        "- canna trota lago\n"
-        "- filo trecciato"
-    )
-
-def ask_openai(question: str, context: str, model_name: str) -> str:
-    if client is None:
-        return "API key OpenAI mancante o non valida."
-
-    system_prompt = (
-        "Sei l'assistente del sito MGFishing. "
-        "Rispondi solo usando il contesto fornito. "
-        "Non inventare informazioni. "
-        "Rispondi in italiano in modo chiaro, utile e naturale."
-    )
-
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Domanda: {question}\n\nContesto:\n{context}"}
-            ],
-            temperature=0.2
-        )
-        return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"Errore OpenAI: {str(e)}"
+        print(f"[CACHE] Errore lettura cache: {e}")
+        return None
 
-# =========================
-# SIDEBAR
-# =========================
-with st.sidebar:
-    st.header("Impostazioni")
 
-    sitemap_url = st.text_input(
-        "Sitemap URL",
-        value="https://www.mgfishing.eu/1_index_sitemap.xml"
-    )
+def refresh_products(force=False):
+    global PRODUCTS, LAST_CATALOG_UPDATE
 
-    model_name = st.selectbox(
-        "Modello OpenAI",
-        options=["gpt-4o-mini", "gpt-4.1-mini"],
-        index=0
-    )
+    cached = load_product_cache()
+    if cached and not force:
+        PRODUCTS = cached
+        LAST_CATALOG_UPDATE = int(time.time())
+        print(f"[CATALOGO] Caricato da cache: {len(PRODUCTS)} prodotti")
+        return
 
-    max_pages = st.slider(
-        "Numero massimo pagine da indicizzare",
-        min_value=10,
-        max_value=200,
-        value=80,
-        step=10
-    )
+    fresh_products = build_product_catalog()
+    if fresh_products:
+        PRODUCTS = fresh_products
+        LAST_CATALOG_UPDATE = int(time.time())
+        save_product_cache(PRODUCTS)
+        print(f"[CATALOGO] Caricato da sitemap: {len(PRODUCTS)} prodotti")
+    else:
+        # se la sitemap fallisce ma esiste la cache vecchia, prova a riusarla
+        if cached:
+            PRODUCTS = cached
+            LAST_CATALOG_UPDATE = int(time.time())
+            print(f"[CATALOGO] Uso cache esistente: {len(PRODUCTS)} prodotti")
+        else:
+            PRODUCTS = []
+            LAST_CATALOG_UPDATE = int(time.time())
+            print("[CATALOGO] Nessun prodotto disponibile")
 
-    update_clicked = st.button("🔄 Aggiorna indicizzazione", use_container_width=True)
 
-    st.markdown("---")
-    st.markdown("**Consiglio iniziale:**")
-    st.markdown("- prova con 60-120 pagine")
-    st.markdown("- aggiorna solo quando serve")
+def auto_refresh_catalog():
+    while True:
+        try:
+            time.sleep(AUTO_REFRESH_INTERVAL)
+            print("[CATALOGO] Refresh automatico in corso...")
+            refresh_products(force=True)
+        except Exception as e:
+            print(f"[CATALOGO] Errore refresh automatico: {e}")
 
-# =========================
-# MAIN UI
-# =========================
-st.title("🎣 Assistente MGFishing")
-st.caption("Risposte basate sui contenuti del sito MGFishing")
 
-# Caricamento cache all'avvio
-if not st.session_state.index_ready:
-    cached = load_cache()
-    if cached:
-        st.session_state.knowledge_base = cached.get("knowledge_base", [])
-        st.session_state.indexed_urls = cached.get("indexed_urls", [])
-        st.session_state.index_ready = len(st.session_state.knowledge_base) > 0
+# =========================================================
+# RICERCA PRODOTTI
+# =========================================================
 
-# Aggiornamento solo su pulsante
-if update_clicked:
-    progress_bar = st.progress(0)
-    status_box = st.empty()
+def tokenize(text: str):
+    return [w for w in normalize_text(text).split() if w]
 
-    with st.spinner("Sto leggendo la sitemap e preparando il contenuto del sito..."):
-        kb, urls = build_knowledge_base(
-            sitemap_url=sitemap_url,
-            max_pages=max_pages,
-            progress_bar=progress_bar,
-            status_box=status_box
+
+def score_product_match(query: str, product_normalized_title: str) -> float:
+    q = normalize_text(query)
+    p = normalize_text(product_normalized_title)
+
+    if not q or not p:
+        return 0.0
+
+    if q == p:
+        return 1.0
+
+    score = similarity(q, p)
+
+    q_words = set(tokenize(q))
+    p_words = set(tokenize(p))
+
+    if q_words and p_words:
+        common = q_words.intersection(p_words)
+        coverage = len(common) / max(len(q_words), 1)
+        score += coverage * 0.25
+
+        # bonus se tutte le parole query sono nel titolo prodotto
+        if q_words.issubset(p_words):
+            score += 0.20
+
+    if q in p:
+        score += 0.15
+
+    if p in q:
+        score += 0.10
+
+    return min(score, 1.0)
+
+
+def extract_possible_product_name(user_message: str) -> str:
+    text = normalize_text(user_message)
+
+    patterns = [
+        r"(?:link di|link del|link prodotto|url di|url del|mandami il link di|mandami il prodotto|pagina prodotto di)\s+(.+)",
+        r"(?:cerco|voglio|mi serve|dammi)\s+(.+)",
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip()
+            if candidate:
+                return candidate
+
+    return text
+
+
+def find_best_product(user_query: str):
+    if not PRODUCTS:
+        return None
+
+    q = extract_possible_product_name(user_query)
+    q = normalize_text(q)
+
+    if not q:
+        return None
+
+    best = None
+    best_score = 0.0
+
+    for product in PRODUCTS:
+        s = score_product_match(q, product["normalized_title"])
+        if s > best_score:
+            best_score = s
+            best = product
+
+    if best and best_score >= 0.78:
+        return best
+
+    return None
+
+
+def is_link_request(user_message: str) -> bool:
+    msg = normalize_text(user_message)
+
+    keywords = [
+        "link",
+        "url",
+        "pagina prodotto",
+        "scheda prodotto",
+        "mandami il prodotto",
+        "dammi il prodotto",
+        "apri il prodotto",
+        "prodotto specifico",
+        "hai questo prodotto",
+        "cerco questo prodotto",
+    ]
+
+    return any(k in msg for k in keywords)
+
+
+# =========================================================
+# RISPOSTE RAPIDE
+# =========================================================
+
+def get_quick_reply(user_message: str):
+    msg = normalize_text(user_message)
+
+    greetings = ["ciao", "salve", "buongiorno", "buonasera", "hey", "ehi"]
+    thanks = ["grazie", "perfetto grazie", "ok grazie", "ti ringrazio"]
+
+    if msg in greetings:
+        return "Ciao! 👋 Benvenuto su MGFishing Verde Pesca. Se vuoi posso aiutarti a trovare un prodotto, un link specifico oppure darti consigli su attrezzatura e tecniche di pesca."
+
+    if msg in thanks:
+        return "Di nulla! Se vuoi, scrivimi pure il nome del prodotto e ti aiuto a trovarlo."
+
+    if msg in ["ok", "va bene", "perfetto"]:
+        return "Perfetto 👍 Scrivimi pure cosa stai cercando."
+
+    return None
+
+
+# =========================================================
+# OPENAI
+# =========================================================
+
+def call_openai(user_message: str, matched_product=None):
+    if not OPENAI_API_KEY:
+        return "Al momento il servizio chat non è configurato correttamente. Riprova più tardi."
+
+    system_prompt = f"""
+Sei l'assistente virtuale di MGFishing Verde Pesca.
+Rispondi sempre in italiano, in modo chiaro, utile e naturale.
+
+Regole fondamentali:
+- Non parlare di sitemap, cache, aggiornamenti interni, file, API o aspetti tecnici.
+- Non inventare disponibilità, prezzi o dettagli non certi.
+- Se conosci il link preciso di un prodotto fornito dal sistema, usalo.
+- Se il cliente saluta, rispondi in modo breve e cordiale.
+- Se il cliente cerca un prodotto specifico e il sistema lo ha trovato, indica il prodotto con il link diretto.
+- Se il prodotto non è stato trovato con certezza, invita il cliente a scrivere il nome completo del prodotto.
+- Non mandare link di categoria come se fossero il prodotto esatto.
+- Mantieni un tono commerciale ma non insistente.
+- Se il cliente chiede consigli di pesca o attrezzatura, rispondi in modo utile e concreto.
+"""
+
+    product_context = ""
+    if matched_product:
+        product_context = (
+            f"\nProdotto trovato dal sistema:\n"
+            f"Titolo: {matched_product['title']}\n"
+            f"URL: {matched_product['url']}\n"
         )
 
-    st.session_state.knowledge_base = kb
-    st.session_state.indexed_urls = urls
-    st.session_state.index_ready = len(kb) > 0
+    user_input = f"Messaggio cliente: {user_message}{product_context}"
 
-    save_cache(kb, urls, sitemap_url, max_pages)
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": system_prompt
+            },
+            {
+                "role": "user",
+                "content": user_input
+            }
+        ],
+        "temperature": 0.6
+    }
 
-    progress_bar.empty()
-    status_box.empty()
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-    if st.session_state.index_ready:
-        st.success(f"Indicizzazione aggiornata: {len(kb)} pagine lette")
-    else:
-        st.error("Non sono riuscito a leggere la sitemap o le pagine del sito.")
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=REQUEST_TIMEOUT
+        )
 
-# Stato attuale
-if st.session_state.index_ready:
-    st.success(f"Knowledge base pronta: {len(st.session_state.knowledge_base)} pagine già caricate")
-else:
-    st.warning("Knowledge base non ancora caricata. Premi 'Aggiorna indicizzazione'.")
+        if response.status_code != 200:
+            print(f"[OPENAI] Errore HTTP {response.status_code}: {response.text}")
+            return "Al momento non riesco a rispondere correttamente. Riprova tra poco."
 
-# Messaggio iniziale
-if len(st.session_state.messages) == 0:
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": "Ciao, sono l'assistente MGFishing. Chiedimi informazioni sui prodotti presenti sul sito."
+        data = response.json()
+
+        # nuovo formato Responses API
+        text = data.get("output_text")
+        if text and isinstance(text, str) and text.strip():
+            return text.strip()
+
+        # fallback robusto
+        output = data.get("output", [])
+        collected = []
+
+        for item in output:
+            content_list = item.get("content", [])
+            for c in content_list:
+                if c.get("type") == "output_text":
+                    piece = c.get("text", "")
+                    if piece:
+                        collected.append(piece)
+
+        final_text = "\n".join(collected).strip()
+        if final_text:
+            return final_text
+
+        return "Al momento non riesco a generare una risposta utile. Riprova tra poco."
+
+    except Exception as e:
+        print(f"[OPENAI] Eccezione: {e}")
+        return "Al momento non riesco a rispondere correttamente. Riprova tra poco."
+
+
+# =========================================================
+# ROUTES
+# =========================================================
+
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "status": "ok",
+        "service": "MGFishing Chatbot"
     })
 
-# Chat history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
 
-# Input
-user_query = st.chat_input("Scrivi qui la tua domanda...")
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "ok",
+        "products_loaded": len(PRODUCTS),
+        "catalog_last_update": LAST_CATALOG_UPDATE
+    })
 
-if user_query:
-    st.session_state.messages.append({"role": "user", "content": user_query})
 
-    with st.chat_message("user"):
-        st.markdown(user_query)
+@app.route("/refresh-products", methods=["POST"])
+def refresh_products_endpoint():
+    # endpoint opzionale protetto con token semplice
+    admin_token = os.getenv("ADMIN_TOKEN", "").strip()
+    sent_token = request.headers.get("X-Admin-Token", "").strip()
 
-    with st.chat_message("assistant"):
-        if is_greeting(user_query):
-            answer = greeting_response()
-            st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            st.stop()
+    if not admin_token or sent_token != admin_token:
+        return jsonify({"ok": False, "message": "Non autorizzato"}), 401
 
-        if is_smalltalk(user_query):
-            answer = smalltalk_response(user_query)
-            st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            st.stop()
+    refresh_products(force=True)
+    return jsonify({
+        "ok": True,
+        "message": "Catalogo aggiornato",
+        "products_loaded": len(PRODUCTS)
+    })
 
-        kb = st.session_state.knowledge_base
 
-        if not kb:
-            answer = "La knowledge base non è ancora pronta. Premi su 'Aggiorna indicizzazione' nella barra laterale."
-            st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            st.stop()
+@app.route("/chat", methods=["POST"])
+def chat():
+    try:
+        data = request.get_json(silent=True) or {}
+        user_message = (data.get("message") or "").strip()
 
-        relevant_pages = search_relevant_pages(user_query, kb, top_k=4)
+        if not user_message:
+            return jsonify({
+                "reply": "Scrivi pure la tua domanda."
+            })
 
-        if not relevant_pages:
-            answer = fallback_no_results()
-            st.markdown(answer)
-            st.session_state.messages.append({"role": "assistant", "content": answer})
-            st.stop()
+        # 1) risposta rapida per saluti ecc.
+        quick_reply = get_quick_reply(user_message)
+        if quick_reply:
+            return jsonify({"reply": quick_reply})
 
-        context = build_context_from_pages(relevant_pages)
+        # 2) prova ricerca prodotto esatto
+        matched_product = find_best_product(user_message)
 
-        with st.spinner("Sto preparando la risposta..."):
-            answer = ask_openai(user_query, context, model_name)
+        # 3) se l'utente vuole un link e il prodotto è stato trovato -> manda subito link diretto
+        if is_link_request(user_message) and matched_product:
+            return jsonify({
+                "reply": f"Ho trovato il prodotto che cerchi:\n{matched_product['title']}\n{matched_product['url']}"
+            })
 
-        if answer.startswith("Errore OpenAI:"):
-            st.error(answer)
-        else:
-            st.markdown(answer)
+        # 4) se l'utente vuole chiaramente un link prodotto ma non c'è match certo
+        if is_link_request(user_message) and not matched_product:
+            return jsonify({
+                "reply": "Non ho trovato con certezza il prodotto esatto. Scrivimi il nome completo del prodotto e provo a trovarti il link diretto."
+            })
 
-        st.session_state.messages.append({"role": "assistant", "content": answer})
+        # 5) se il prodotto viene riconosciuto in una normale domanda, dai contesto a OpenAI
+        ai_reply = call_openai(user_message, matched_product=matched_product)
+
+        # 6) piccola sicurezza finale: se AI non risponde bene
+        if not ai_reply or not ai_reply.strip():
+            ai_reply = "Posso aiutarti a trovare prodotti, link specifici o consigliarti l'attrezzatura giusta."
+
+        return jsonify({"reply": ai_reply.strip()})
+
+    except Exception as e:
+        print(f"[CHAT] Errore: {e}")
+        return jsonify({
+            "reply": "Si è verificato un problema temporaneo. Riprova tra poco."
+        }), 500
+
+
+# =========================================================
+# AVVIO
+# =========================================================
+
+def startup():
+    refresh_products(force=False)
+
+    thread = threading.Thread(target=auto_refresh_catalog, daemon=True)
+    thread.start()
+
+
+startup()
+
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)

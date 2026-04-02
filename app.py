@@ -1,301 +1,327 @@
 import os
 import re
-import html
 import time
+import html
 import requests
 import streamlit as st
 import xml.etree.ElementTree as ET
 
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 from openai import OpenAI
 
 # =========================
 # CONFIG
 # =========================
-SITEMAP_URL = "https://www.mgfishing.eu/1_index_sitemap.xml"
-SITE_DOMAIN = "www.mgfishing.eu"
-DEFAULT_MODEL = "gpt-5-mini"
+st.set_page_config(page_title="Assistente MGFishing", page_icon="🎣", layout="wide")
 
-REQUEST_TIMEOUT = 20
-MAX_URLS_TO_INDEX = 120
-MAX_PAGES_FOR_CONTEXT = 6
-MAX_CHARS_PER_PAGE = 5000
-
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; MGFishingBot/1.0; +https://www.mgfishing.eu)"
-)
-
-# =========================
-# PAGE CONFIG
-# =========================
-st.set_page_config(
-    page_title="Assistente MGFishing",
-    page_icon="🎣",
-    layout="wide",
-)
-
-st.title("🎣 Assistente MGFishing")
-st.caption("Risposte basate sui contenuti del sito MGFishing")
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
 
 # =========================
 # OPENAI CLIENT
 # =========================
-api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+client = None
+if OPENAI_API_KEY:
+    client = OpenAI(api_key=OPENAI_API_KEY)
 
-if not api_key:
-    st.error("Manca la OPENAI_API_KEY. Inseriscila nei secrets di Streamlit oppure nelle variabili ambiente.")
-    st.stop()
+# =========================
+# SESSION STATE
+# =========================
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
-client = OpenAI(api_key=api_key)
+if "knowledge_base" not in st.session_state:
+    st.session_state.knowledge_base = []
+
+if "indexed_urls" not in st.session_state:
+    st.session_state.indexed_urls = []
+
+if "index_ready" not in st.session_state:
+    st.session_state.index_ready = False
+
+if "last_sitemap_url" not in st.session_state:
+    st.session_state.last_sitemap_url = ""
+
+if "last_max_pages" not in st.session_state:
+    st.session_state.last_max_pages = 0
 
 # =========================
 # HELPERS
 # =========================
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; MGFishingBot/1.0)"
+}
+
 def normalize_text(text: str) -> str:
-    text = html.unescape(text or "")
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text.strip().lower())
 
+def is_greeting(text: str) -> bool:
+    t = normalize_text(text)
+    greetings = {
+        "ciao",
+        "ciao!",
+        "salve",
+        "salve!",
+        "buongiorno",
+        "buongiorno!",
+        "buonasera",
+        "buonasera!",
+        "hey",
+        "hey!",
+        "ehi",
+        "ehi!",
+        "ciao assistente",
+        "ciao bot",
+        "ciao chatbot"
+    }
+    return t in greetings
 
-def clean_page_text(raw_html: str) -> tuple[str, str]:
-    soup = BeautifulSoup(raw_html, "html.parser")
+def greeting_response() -> str:
+    return (
+        "Ciao 👋 Sono l'assistente MGFishing.\n\n"
+        "Posso aiutarti a trovare prodotti, caratteristiche, utilizzi e dettagli presenti sul sito.\n\n"
+        "Ad esempio puoi scrivermi:\n"
+        "- mulinello per surfcasting\n"
+        "- canna da trota lago\n"
+        "- trecciato per spinning\n"
+        "- oppure il nome preciso di un prodotto"
+    )
 
-    for tag in soup(["script", "style", "noscript", "iframe", "svg"]):
+def is_smalltalk(text: str) -> bool:
+    t = normalize_text(text)
+    smalltalk_items = {
+        "come stai",
+        "come va",
+        "chi sei",
+        "cosa fai",
+        "mi aiuti",
+        "puoi aiutarmi",
+        "sei online",
+        "ok",
+        "perfetto",
+        "grazie",
+        "grazie!",
+    }
+    return t in smalltalk_items
+
+def smalltalk_response(text: str) -> str:
+    t = normalize_text(text)
+
+    if t in {"come stai", "come va"}:
+        return "Sto bene, grazie 😊 Sono qui per aiutarti a trovare prodotti e informazioni presenti sul sito MGFishing."
+    if t == "chi sei":
+        return "Sono l'assistente MGFishing. Posso aiutarti a cercare prodotti, caratteristiche e dettagli presenti sul sito."
+    if t in {"cosa fai", "mi aiuti", "puoi aiutarmi"}:
+        return (
+            "Sì, certo 😊 Posso aiutarti a trovare prodotti presenti sul sito MGFishing, "
+            "confrontare caratteristiche e indicarti dettagli utili in base alla tua richiesta."
+        )
+    if t == "sei online":
+        return "Sì, sono qui 👍 Scrivimi pure cosa stai cercando."
+    if t in {"ok", "perfetto"}:
+        return "Perfetto 👍 Scrivimi pure il nome del prodotto oppure la tipologia che stai cercando."
+    if t in {"grazie", "grazie!"}:
+        return "Di nulla 😊 Se vuoi, scrivimi pure il nome del prodotto o la tecnica di pesca che ti interessa."
+
+    return "Certo 😊 Scrivimi pure cosa stai cercando sul sito MGFishing."
+
+def clean_page_text(html_content: str) -> str:
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    for tag in soup(["script", "style", "noscript", "header", "footer", "svg", "img", "form", "nav"]):
         tag.decompose()
 
-    title = ""
-    if soup.title and soup.title.text:
-        title = normalize_text(soup.title.text)
+    text = soup.get_text(separator=" ", strip=True)
+    text = html.unescape(text)
+    text = re.sub(r"\s+", " ", text).strip()
 
-    # Prova a prendere contenuto più utile
-    candidates = []
+    return text
 
-    selectors = [
-        "main",
-        "#content",
-        ".page-content",
-        ".product-information",
-        ".product-description",
-        ".cms",
-        "article",
-        "body",
-    ]
+def fetch_url(url: str, timeout: int = 20) -> str:
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=timeout)
+        r.raise_for_status()
+        return r.text
+    except Exception:
+        return ""
 
-    for sel in selectors:
-        found = soup.select_one(sel)
-        if found:
-            candidates.append(found.get_text(" ", strip=True))
-
-    text = max(candidates, key=len) if candidates else soup.get_text(" ", strip=True)
-    text = normalize_text(text)
-
-    return title, text
-
-
-def get_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
-    return session
-
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_xml(url: str) -> bytes:
-    session = get_session()
-    r = session.get(url, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.content
-
-
-def parse_sitemap_recursive(url: str, collected: list[str] | None = None) -> list[str]:
-    if collected is None:
-        collected = []
-
-    content = fetch_xml(url)
+def parse_sitemap(sitemap_url: str) -> list:
+    xml_text = fetch_url(sitemap_url, timeout=20)
+    if not xml_text:
+        return []
 
     try:
-        root = ET.fromstring(content)
+        root = ET.fromstring(xml_text)
     except Exception:
-        return collected
+        return []
 
     ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
 
-    # sitemap index
-    sitemap_tags = root.findall(".//sm:sitemap/sm:loc", ns)
-    if sitemap_tags:
-        for loc in sitemap_tags:
-            child_url = (loc.text or "").strip()
-            if child_url:
-                parse_sitemap_recursive(child_url, collected)
-        return collected
+    urls = []
 
-    # urlset
-    url_tags = root.findall(".//sm:url/sm:loc", ns)
-    for loc in url_tags:
-        page_url = (loc.text or "").strip()
-        if page_url and SITE_DOMAIN in page_url:
-            collected.append(page_url)
+    # Caso sitemap index
+    sitemap_nodes = root.findall(".//sm:sitemap/sm:loc", ns)
+    if sitemap_nodes:
+        for node in sitemap_nodes:
+            sub_url = node.text.strip()
+            urls.extend(parse_sitemap(sub_url))
+        return list(dict.fromkeys(urls))
 
-    return collected
+    # Caso urlset
+    url_nodes = root.findall(".//sm:url/sm:loc", ns)
+    for node in url_nodes:
+        if node.text:
+            urls.append(node.text.strip())
 
+    return list(dict.fromkeys(urls))
 
-def is_useful_url(url: str) -> bool:
-    blocked_patterns = [
+def filter_useful_urls(urls: list) -> list:
+    blocked_parts = [
         "/login",
         "/autenticazione",
-        "/order",
+        "/password",
+        "/ordine",
         "/carrello",
         "/checkout",
-        "/password",
-        "/quick-order",
+        "/contattaci",
         "/guest-tracking",
         "/module/",
-        "controller=authentication",
-        "controller=order",
-        "controller=cart",
+        "?",
+        "#",
     ]
-    low_value_extensions = [".jpg", ".jpeg", ".png", ".webp", ".gif", ".pdf", ".xml"]
 
-    lower = url.lower()
+    cleaned = []
+    for url in urls:
+        low = url.lower()
+        if any(part in low for part in blocked_parts):
+            continue
+        cleaned.append(url)
 
-    if any(lower.endswith(ext) for ext in low_value_extensions):
-        return False
+    return list(dict.fromkeys(cleaned))
 
-    if any(pat in lower for pat in blocked_patterns):
-        return False
+def build_knowledge_base(sitemap_url: str, max_pages: int = 20, progress_bar=None, status_box=None):
+    urls = parse_sitemap(sitemap_url)
+    urls = filter_useful_urls(urls)
+    urls = urls[:max_pages]
 
-    return True
+    kb = []
 
+    for i, url in enumerate(urls, start=1):
+        if status_box:
+            status_box.info(f"Lettura pagina {i}/{len(urls)}: {url}")
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_page(url: str) -> dict:
-    session = get_session()
-    r = session.get(url, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-
-    title, text = clean_page_text(r.text)
-
-    return {
-        "url": url,
-        "title": title,
-        "text": text[:MAX_CHARS_PER_PAGE],
-    }
-
-
-@st.cache_data(show_spinner=True, ttl=3600)
-def build_knowledge_base(sitemap_url: str, max_urls: int) -> list[dict]:
-    all_urls = parse_sitemap_recursive(sitemap_url)
-    seen = set()
-    cleaned_urls = []
-
-    for url in all_urls:
-        if url not in seen and is_useful_url(url):
-            seen.add(url)
-            cleaned_urls.append(url)
-
-    cleaned_urls = cleaned_urls[:max_urls]
-
-    docs = []
-    for idx, url in enumerate(cleaned_urls, start=1):
-        try:
-            doc = fetch_page(url)
-            if doc["text"] and len(doc["text"]) > 150:
-                docs.append(doc)
-        except Exception:
+        html_content = fetch_url(url, timeout=20)
+        if not html_content:
             continue
 
-        # piccolo respiro per non stressare il sito
-        time.sleep(0.05)
+        text = clean_page_text(html_content)
+        if len(text) < 200:
+            continue
 
-    return docs
+        title = ""
+        try:
+            soup = BeautifulSoup(html_content, "html.parser")
+            if soup.title and soup.title.string:
+                title = soup.title.string.strip()
+        except Exception:
+            title = ""
 
+        kb.append({
+            "url": url,
+            "title": title,
+            "content": text[:12000]
+        })
 
-def tokenize(text: str) -> list[str]:
-    text = (text or "").lower()
-    text = re.sub(r"[^a-z0-9àèéìòù]+", " ", text)
-    return [t for t in text.split() if len(t) > 1]
+        if progress_bar:
+            progress_bar.progress(min(i / max(len(urls), 1), 1.0))
 
+        time.sleep(0.2)
 
-def score_document(query: str, doc: dict) -> int:
-    query_tokens = tokenize(query)
-    if not query_tokens:
+    return kb, urls
+
+def score_page(query: str, page_text: str, page_title: str = "") -> int:
+    q = normalize_text(query)
+    content = normalize_text(page_text)
+    title = normalize_text(page_title)
+
+    words = [w for w in re.findall(r"\w+", q) if len(w) > 2]
+    if not words:
         return 0
 
-    haystack_title = (doc.get("title") or "").lower()
-    haystack_text = (doc.get("text") or "").lower()
-    haystack_url = (doc.get("url") or "").lower()
-
     score = 0
-    for token in query_tokens:
-        score += haystack_title.count(token) * 8
-        score += haystack_url.count(token) * 6
-        score += haystack_text.count(token) * 2
+    for w in words:
+        score += content.count(w)
+        score += title.count(w) * 3
 
-    # bonus per query composta
-    joined_query = " ".join(query_tokens)
-    if joined_query and joined_query in haystack_text:
+    if q in content:
+        score += 15
+    if q in title:
         score += 20
 
     return score
 
-
-def retrieve_relevant_docs(query: str, docs: list[dict], top_k: int = MAX_PAGES_FOR_CONTEXT) -> list[dict]:
+def search_relevant_pages(query: str, kb: list, top_k: int = 4) -> list:
     scored = []
-    for doc in docs:
-        s = score_document(query, doc)
-        if s > 0:
-            scored.append((s, doc))
+    for item in kb:
+        score = score_page(query, item.get("content", ""), item.get("title", ""))
+        if score > 0:
+            scored.append((score, item))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [doc for _, doc in scored[:top_k]]
+    return [item for _, item in scored[:top_k]]
 
-
-def build_context_snippets(docs: list[dict]) -> str:
-    blocks = []
-    for i, doc in enumerate(docs, start=1):
-        block = (
-            f"[FONTE {i}]\n"
-            f"URL: {doc['url']}\n"
-            f"TITOLO: {doc['title']}\n"
-            f"CONTENUTO:\n{doc['text']}\n"
+def build_context_from_pages(pages: list) -> str:
+    chunks = []
+    for i, page in enumerate(pages, start=1):
+        chunk = (
+            f"Fonte {i}\n"
+            f"Titolo: {page.get('title', '')}\n"
+            f"URL: {page.get('url', '')}\n"
+            f"Contenuto: {page.get('content', '')[:4000]}\n"
         )
-        blocks.append(block)
-    return "\n\n".join(blocks)
+        chunks.append(chunk)
+    return "\n\n".join(chunks)
 
-
-def ask_openai(question: str, context: str, model: str) -> str:
-    system_prompt = """
-Sei l'assistente ecommerce di MGFishing.
-Rispondi in italiano.
-Usa solo le informazioni presenti nel CONTEXTO del sito.
-Se il contesto non contiene abbastanza informazioni, dillo chiaramente.
-Non inventare disponibilità, prezzi, misure o caratteristiche.
-Se utile, suggerisci di visitare la pagina prodotto citando il link presente nel contesto.
-Mantieni risposte chiare, commerciali e utili al cliente finale.
-"""
-
-    user_prompt = f"""
-CONTEXTO DEL SITO:
-{context}
-
-DOMANDA UTENTE:
-{question}
-
-ISTRUZIONI:
-- Rispondi solo con dati supportati dal contesto.
-- Se ci sono più prodotti o link utili, elencali in modo chiaro.
-- Se non trovi abbastanza informazioni, scrivi che non hai trovato dati sufficienti nel sito.
-"""
-
-    response = client.responses.create(
-        model=model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+def fallback_no_results() -> str:
+    return (
+        "Non ho trovato abbastanza informazioni nel sito per rispondere con precisione.\n\n"
+        "Prova a scrivere:\n"
+        "- il nome preciso del prodotto\n"
+        "- una categoria\n"
+        "- la tecnica di pesca\n\n"
+        "Ad esempio: mulinello surfcasting, canna trota lago, filo trecciato."
     )
 
-    return (response.output_text or "").strip()
+def ask_openai(question: str, context: str, model_name: str) -> str:
+    if client is None:
+        return "Manca la API key di OpenAI nelle secrets di Streamlit."
 
+    system_prompt = (
+        "Sei l'assistente del sito MGFishing.\n"
+        "Rispondi SOLO usando le informazioni contenute nel contesto fornito.\n"
+        "Se il contesto non è sufficiente, dillo chiaramente senza inventare.\n"
+        "Rispondi in italiano in modo chiaro, utile e commerciale ma naturale.\n"
+        "Se possibile suggerisci all'utente di indicare il nome preciso del prodotto o della categoria.\n"
+    )
+
+    user_prompt = (
+        f"DOMANDA UTENTE:\n{question}\n\n"
+        f"CONTESTO DEL SITO:\n{context}\n\n"
+        "Rispondi solo in base al contesto."
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.2,
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Errore OpenAI: {e}"
 
 # =========================
 # SIDEBAR
@@ -303,78 +329,129 @@ ISTRUZIONI:
 with st.sidebar:
     st.header("Impostazioni")
 
-    sitemap_url = st.text_input("Sitemap URL", value=SITEMAP_URL)
-    model_name = st.text_input("Modello OpenAI", value=DEFAULT_MODEL)
-    max_urls = st.slider("Numero massimo pagine da indicizzare", 20, 200, MAX_URLS_TO_INDEX, 10)
+    sitemap_url = st.text_input(
+        "Sitemap URL",
+        value=st.session_state.last_sitemap_url or "https://www.mgfishing.eu/1_index_sitemap.xml"
+    )
 
-    if st.button("🔄 Aggiorna indicizzazione"):
-        st.cache_data.clear()
-        st.success("Cache svuotata. Alla prossima domanda ricarico tutto.")
+    model_name = st.selectbox(
+        "Modello OpenAI",
+        options=["gpt-5-mini", "gpt-4o-mini"],
+        index=0
+    )
+
+    max_pages = st.slider(
+        "Numero massimo pagine da indicizzare",
+        min_value=5,
+        max_value=150,
+        value=20,
+        step=1
+    )
+
+    update_clicked = st.button("🔄 Aggiorna indicizzazione", use_container_width=True)
 
     st.markdown("---")
-    st.write("Consiglio iniziale:")
-    st.write("- prova con 60-120 pagine")
-    st.write("- poi aumenta solo se serve")
-
-
-# =========================
-# LOAD KNOWLEDGE BASE
-# =========================
-with st.spinner("Sto leggendo la sitemap e preparando il contenuto del sito..."):
-    try:
-        docs = build_knowledge_base(sitemap_url, max_urls)
-    except Exception as e:
-        st.error(f"Errore durante la lettura della sitemap: {e}")
-        st.stop()
-
-st.success(f"Indicizzazione pronta: {len(docs)} pagine lette")
+    st.caption("Consiglio iniziale:")
+    st.markdown("- prova con 60-120 pagine")
+    st.markdown("- poi aumenta solo se serve")
 
 # =========================
-# CHAT STATE
+# MAIN UI
 # =========================
-if "messages" not in st.session_state:
-    st.session_state.messages = [
-        {
-            "role": "assistant",
-            "content": "Ciao, sono l'assistente MGFishing. Chiedimi informazioni sui prodotti presenti sul sito.",
-        }
-    ]
+st.title("🎣 Assistente MGFishing")
+st.caption("Risposte basate sui contenuti del sito MGFishing")
 
+# Prima indicizzazione automatica
+need_auto_index = (
+    not st.session_state.index_ready
+    or st.session_state.last_sitemap_url != sitemap_url
+    or st.session_state.last_max_pages != max_pages
+)
+
+if update_clicked or need_auto_index:
+    progress_bar = st.progress(0)
+    status_box = st.empty()
+
+    with st.spinner("Sto leggendo la sitemap e preparando il contenuto del sito..."):
+        kb, urls = build_knowledge_base(
+            sitemap_url=sitemap_url,
+            max_pages=max_pages,
+            progress_bar=progress_bar,
+            status_box=status_box
+        )
+
+    st.session_state.knowledge_base = kb
+    st.session_state.indexed_urls = urls
+    st.session_state.index_ready = True
+    st.session_state.last_sitemap_url = sitemap_url
+    st.session_state.last_max_pages = max_pages
+
+    progress_bar.empty()
+    status_box.empty()
+
+if st.session_state.index_ready:
+    st.success(f"Indicizzazione pronta: {len(st.session_state.knowledge_base)} pagine lette")
+
+# Messaggio iniziale
+if len(st.session_state.messages) == 0:
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": "Ciao, sono l'assistente MGFishing. Chiedimi informazioni sui prodotti presenti sul sito."
+    })
+
+# Visualizza chat
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        st.write(msg["content"])
+        st.markdown(msg["content"])
 
-# =========================
-# USER INPUT
-# =========================
-question = st.chat_input("Scrivi qui la tua domanda...")
+# Input utente
+user_query = st.chat_input("Scrivi qui la tua domanda...")
 
-if question:
-    st.session_state.messages.append({"role": "user", "content": question})
+if user_query:
+    st.session_state.messages.append({"role": "user", "content": user_query})
 
     with st.chat_message("user"):
-        st.write(question)
+        st.markdown(user_query)
 
     with st.chat_message("assistant"):
-        with st.spinner("Cerco le pagine più utili..."):
-            relevant_docs = retrieve_relevant_docs(question, docs, top_k=MAX_PAGES_FOR_CONTEXT)
+        # 1) SALUTI
+        if is_greeting(user_query):
+            answer = greeting_response()
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.stop()
 
-            if not relevant_docs:
-                answer = "Non ho trovato contenuti sufficienti nel sito per rispondere bene a questa domanda."
-                st.write(answer)
-                st.session_state.messages.append({"role": "assistant", "content": answer})
-            else:
-                context = build_context_snippets(relevant_docs)
+        # 2) SMALL TALK
+        if is_smalltalk(user_query):
+            answer = smalltalk_response(user_query)
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.stop()
 
-                try:
-                    answer = ask_openai(question, context, model_name)
-                except Exception as e:
-                    answer = f"Errore nella risposta del modello: {e}"
+        # 3) CONTROLLO INDICIZZAZIONE
+        kb = st.session_state.knowledge_base
+        if not kb:
+            answer = "Non ho ancora caricato i contenuti del sito. Premi su 'Aggiorna indicizzazione' nella barra laterale."
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.stop()
 
-                st.write(answer)
+        # 4) CERCA PAGINE RILEVANTI
+        relevant_pages = search_relevant_pages(user_query, kb, top_k=4)
 
-                with st.expander("Link usati per la risposta"):
-                    for doc in relevant_docs:
-                        st.write(f"- {doc['url']}")
+        if not relevant_pages:
+            answer = fallback_no_results()
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+            st.stop()
 
-                st.session_state.messages.append({"role": "assistant", "content": answer})
+        context = build_context_from_pages(relevant_pages)
+
+        with st.spinner("Sto preparando la risposta..."):
+            answer = ask_openai(user_query, context, model_name)
+
+        if not answer or "non so" in normalize_text(answer):
+            answer = fallback_no_results()
+
+        st.markdown(answer)
+        st.session_state.messages.append({"role": "assistant", "content": answer})

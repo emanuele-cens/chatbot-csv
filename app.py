@@ -205,24 +205,53 @@ def detect_best_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]
     return None
 
 
-@st.cache_data(show_spinner=False)
-def load_catalog(csv_path: str) -> pd.DataFrame:
-    if not os.path.exists(csv_path):
-        return pd.DataFrame()
+@st.cache_data
+def load_catalog(csv_path):
+    import pandas as pd
 
-    df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+    # Tentativi multipli di lettura per CSV diversi
+    attempts = [
+        {"sep": ",", "encoding": "utf-8", "engine": "python"},
+        {"sep": ";", "encoding": "utf-8", "engine": "python"},
+        {"sep": ",", "encoding": "latin1", "engine": "python"},
+        {"sep": ";", "encoding": "latin1", "engine": "python"},
+    ]
 
-    if df.empty:
-        return df
+    last_error = None
 
-    name_col = detect_best_column(df, ["name", "product_name", "nome", "title"])
-    desc_col = detect_best_column(df, ["description", "descrizione", "short_description", "desc"])
-    url_col = detect_best_column(df, ["url", "link", "product_url", "permalink"])
-    price_col = detect_best_column(df, ["price", "prezzo", "final_price"])
-    category_col = detect_best_column(df, ["category", "categoria", "cat"])
-    brand_col = detect_best_column(df, ["brand", "marca", "manufacturer"])
-    sku_col = detect_best_column(df, ["sku", "reference", "codice", "ean", "id_product"])
-    stock_col = detect_best_column(df, ["stock", "quantity", "qty", "giacenza", "availability"])
+    for params in attempts:
+        try:
+            df = pd.read_csv(
+                csv_path,
+                dtype=str,
+                keep_default_na=False,
+                on_bad_lines="skip",
+                **params
+            )
+
+            # pulizia nomi colonne
+            df.columns = [str(c).strip() for c in df.columns]
+
+            # elimina colonne completamente vuote
+            df = df.dropna(axis=1, how="all")
+
+            # normalizza contenuti
+            for col in df.columns:
+                df[col] = df[col].astype(str).str.strip()
+
+            # elimina righe completamente vuote
+            df = df[df.apply(lambda row: any(str(v).strip() for v in row), axis=1)]
+
+            if len(df.columns) >= 2 and len(df) > 0:
+                return df
+
+        except Exception as e:
+            last_error = e
+            continue
+
+    raise Exception(f"Errore lettura CSV: {last_error}")
+    catalog_df = load_catalog(CSV_PATH)
+    st.write("Colonne CSV rilevate:", list(catalog_df.columns))
 
     def get_col_value(row, colname):
         if not colname:

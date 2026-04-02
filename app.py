@@ -1,517 +1,375 @@
 import os
 import re
-import time
-import requests
+import pandas as pd
 import streamlit as st
-import xml.etree.ElementTree as ET
-
-from rapidfuzz import fuzz
 from openai import OpenAI
+from rapidfuzz import fuzz
 
 # =========================
 # CONFIG
 # =========================
-SITE_URL = "https://www.mgfishing.eu"
-SITEMAP_CANDIDATES = [
-    f"{SITE_URL}/sitemap.xml",
-    f"{SITE_URL}/1_index_sitemap.xml",
-]
+WHATSAPP_NUMBER = "393494166335"
+WHATSAPP_LABEL = "Emanuele"
+WHATSAPP_URL = f"https://wa.me/{WHATSAPP_NUMBER}"
 
-WHATSAPP_NUMBER = "3494166335"
-WHATSAPP_NAME = "Emanuele"
-
-PRODUCT_QUERY_HINTS = [
-    "prodotto", "mulinello", "canna", "trecciato", "monofilo", "fluorocarbon",
-    "artificiale", "esca", "popper", "minnow", "jig", "amo", "ami", "girella",
-    "galleggiante", "bombarda", "lenza", "trabucco", "daiwa", "shimano", "colmic",
-    "tubertini", "yuki", "molix", "major craft", "rapture", "xenos", "atmos",
-    "caldia", "crossfire", "ballistic", "salty pop", "tk4", "x-rider"
-]
-
-GENERAL_QUERY_HINTS = [
-    "meteo", "vento", "mare", "montatura", "trave", "terminale", "surfcasting",
-    "spinning", "trota", "bolognese", "feeder", "bolentino", "carpfishing",
-    "serra", "spigola", "palamita", "lampuga", "che canna", "che mulinello",
-    "consiglio", "consigli", "come fare", "come pescare"
-]
-
-OPERATOR_HINTS = [
-    "operatore", "umano", "persona", "assistenza", "whatsapp", "contatto",
-    "parlare con qualcuno", "parlare con operatore", "aiuto umano"
-]
-
-SHIPPING_HINTS = [
-    "spedizione", "tracking", "ordine", "consegna", "dove si trova il mio ordine",
-    "quando arriva", "corriere", "pacco"
-]
-
-
-# =========================
-# STREAMLIT PAGE
-# =========================
 st.set_page_config(page_title="MGFishing Chatbot", page_icon="🎣", layout="centered")
-st.title("🎣 MGFishing Assistant")
-
-st.caption("Consigli su prodotti, pesca, montature e supporto clienti MGFishing")
+st.title("🎣 MGFishing Chatbot")
 
 # =========================
-# OPENAI CLIENT
+# OPENAI
 # =========================
 def get_openai_api_key():
-    # Prima prova Streamlit secrets, poi env var
-    key = None
     try:
-        key = st.secrets.get("OPENAI_API_KEY", None)
+        key = st.secrets.get("OPENAI_API_KEY")
+        if key:
+            return key
     except Exception:
-        key = None
-
-    if not key:
-        key = os.getenv("OPENAI_API_KEY", "")
-
-    return key
+        pass
+    return os.getenv("OPENAI_API_KEY", "")
 
 OPENAI_API_KEY = get_openai_api_key()
-
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
 
 # =========================
 # HELPERS
 # =========================
 def normalize_text(text: str) -> str:
-    text = text.lower().strip()
+    if text is None:
+        return ""
+    text = str(text).lower().strip()
     text = text.replace("&", " e ")
     text = re.sub(r"[^a-z0-9àèéìòù\s\-]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-def slug_to_name(url: str) -> str:
-    slug = url.rstrip("/").split("/")[-1]
-    slug = slug.split("?")[0]
-    slug = slug.replace(".html", "")
-    slug = slug.replace("-", " ")
-    slug = re.sub(r"\s+", " ", slug).strip()
-    return slug.title()
+def make_whatsapp_message(text: str = "") -> str:
+    import urllib.parse
+    base_msg = "Ciao Emanuele, vorrei informazioni su un prodotto MGFishing."
+    if text:
+        base_msg = f"Ciao Emanuele, vorrei informazioni su questo prodotto/richiesta: {text}"
+    encoded = urllib.parse.quote(base_msg)
+    return f"{WHATSAPP_URL}?text={encoded}"
 
-def looks_like_product_url(url: str) -> bool:
-    u = url.lower()
-
-    # Escludi categorie, blog, pagine generiche, account, carrello, moduli ecc.
-    excluded = [
-        "/blog", "/category", "/categoria", "/module", "/cart", "/carrello",
-        "/order", "/ordine", "/login", "/my-account", "/content", "/cms",
-        "/manufacturer", "/brand", "/page", "/new-products", "/best-sales",
-        "/prices-drop", "/stores", "/contact", "/contatti", "/sitemap",
-        "/search", "/ricerca", "/accessories", "/supplier", "/tag"
+def is_link_request(text: str) -> bool:
+    t = normalize_text(text)
+    keywords = [
+        "link", "mandami il link", "mi mandi il link", "dammi il link",
+        "url", "pagina prodotto", "apri prodotto", "dove lo trovo"
     ]
-    if any(x in u for x in excluded):
-        return False
+    return any(k in t for k in keywords)
 
-    # Se URL ha .html oppure slug lungo, probabile prodotto
-    if u.endswith(".html"):
-        return True
-
-    path = u.replace(SITE_URL.lower(), "")
-    parts = [p for p in path.split("/") if p]
-    if len(parts) >= 1 and len(parts[-1]) > 8:
-        return True
-
-    return False
-
-def likely_product_question(text: str) -> bool:
+def is_product_request(text: str) -> bool:
     t = normalize_text(text)
-    return any(k in t for k in PRODUCT_QUERY_HINTS)
-
-def likely_general_question(text: str) -> bool:
-    t = normalize_text(text)
-    return any(k in t for k in GENERAL_QUERY_HINTS)
-
-def likely_operator_request(text: str) -> bool:
-    t = normalize_text(text)
-    return any(k in t for k in OPERATOR_HINTS)
-
-def likely_shipping_request(text: str) -> bool:
-    t = normalize_text(text)
-    return any(k in t for k in SHIPPING_HINTS)
-
-
-# =========================
-# SITEMAP / CATALOG CACHE
-# =========================
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)  # 12 ore
-def fetch_sitemap_urls():
-    urls = []
-
-    for sm in SITEMAP_CANDIDATES:
-        try:
-            r = requests.get(sm, timeout=20)
-            if r.status_code == 200 and ("xml" in r.headers.get("content-type", "").lower() or r.text.strip().startswith("<")):
-                found = parse_sitemap(sm, r.text)
-                urls.extend(found)
-        except Exception:
-            continue
-
-    # dedup
-    urls = list(dict.fromkeys(urls))
-    return urls
-
-def parse_sitemap(base_url: str, xml_text: str):
-    found_urls = []
-
-    try:
-        root = ET.fromstring(xml_text)
-    except Exception:
-        return found_urls
-
-    ns = ""
-    if root.tag.startswith("{"):
-        ns = root.tag.split("}")[0] + "}"
-
-    # Caso sitemapindex
-    if root.tag.endswith("sitemapindex"):
-        for sitemap in root.findall(f".//{ns}sitemap"):
-            loc = sitemap.find(f"{ns}loc")
-            if loc is not None and loc.text:
-                child_url = loc.text.strip()
-                try:
-                    r = requests.get(child_url, timeout=20)
-                    if r.status_code == 200:
-                        found_urls.extend(parse_sitemap(child_url, r.text))
-                except Exception:
-                    pass
-        return found_urls
-
-    # Caso urlset
-    if root.tag.endswith("urlset"):
-        for urlnode in root.findall(f".//{ns}url"):
-            loc = urlnode.find(f"{ns}loc")
-            if loc is not None and loc.text:
-                found_urls.append(loc.text.strip())
-
-    return found_urls
-
-@st.cache_data(ttl=60 * 60 * 12, show_spinner=False)
-def build_catalog():
-    urls = fetch_sitemap_urls()
-    products = []
-
-    for url in urls:
-        if looks_like_product_url(url):
-            name = slug_to_name(url)
-            norm_name = normalize_text(name)
-            products.append({
-                "name": name,
-                "norm_name": norm_name,
-                "url": url
-            })
-
-    # dedup final by url
-    dedup = {}
-    for p in products:
-        dedup[p["url"]] = p
-
-    return list(dedup.values())
-
-
-# =========================
-# PRODUCT MATCHING
-# =========================
-def extract_candidate_product_text(user_text: str) -> str:
-    text = normalize_text(user_text)
-
-    patterns = [
-        r"link (?:del|della|di|per)?\s*(.+)",
-        r"cerco (.+)",
-        r"hai (.+)",
-        r"avete (.+)",
-        r"mi trovi (.+)",
-        r"mi mandi (.+)",
-        r"voglio (.+)",
-        r"info su (.+)",
-        r"parlami di (.+)",
-        r"consiglio su (.+)",
+    keywords = [
+        "mulinello", "canna", "filo", "trecciato", "monofilo", "fluorocarbon",
+        "artificiale", "esca", "popper", "minnow", "bombarda", "galleggiante",
+        "girella", "amo", "ami", "trabucco", "daiwa", "shimano", "colmic",
+        "tubertini", "molix", "major craft", "rapture", "prodotto", "articolo",
+        "misura", "taglia", "grammi", "azione", "frizione", "bobina"
     ]
+    return any(k in t for k in keywords)
 
-    for p in patterns:
-        m = re.search(p, text)
-        if m:
-            candidate = m.group(1).strip()
-            if len(candidate) > 2:
-                return candidate
+def is_general_info_request(text: str) -> bool:
+    t = normalize_text(text)
+    keywords = [
+        "meteo", "vento", "mare", "pioggia", "pressione", "temperatura",
+        "montatura", "trave", "terminale", "surfcasting", "bolognese",
+        "spinning", "trota", "feeder", "bolentino", "ledgering", "carpfishing",
+        "come pescare", "come fare", "consiglio", "consigli", "tecnica"
+    ]
+    return any(k in t for k in keywords)
 
-    return text
-
-def score_product_match(query: str, product: dict) -> int:
-    q = normalize_text(query)
-    p = product["norm_name"]
-
-    score1 = fuzz.token_set_ratio(q, p)
-    score2 = fuzz.partial_ratio(q, p)
-    score3 = fuzz.ratio(q, p)
-
-    # bonus se tutte le parole query sono nel nome
-    q_words = [w for w in q.split() if len(w) > 2]
-    contains_bonus = 0
-    if q_words and all(w in p for w in q_words):
-        contains_bonus = 12
-
-    # bonus se almeno metà parole query sono nel nome
-    half_bonus = 0
-    if q_words:
-        hits = sum(1 for w in q_words if w in p)
-        if hits >= max(1, len(q_words) // 2):
-            half_bonus = 7
-
-    final_score = int(max(score1, score2, score3) + contains_bonus + half_bonus)
-    return min(final_score, 100)
-
-def find_best_products(user_text: str, top_k: int = 5):
-    catalog = build_catalog()
-    query = extract_candidate_product_text(user_text)
-
-    scored = []
-    for product in catalog:
-        s = score_product_match(query, product)
-        scored.append((s, product))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[:top_k]
-
-def get_best_product_link(user_text: str):
-    matches = find_best_products(user_text, top_k=5)
-    if not matches:
-        return None, []
-
-    best_score, best_product = matches[0]
-    alternatives = [p for s, p in matches[1:] if s >= 60]
-
-    # soglie più permissive per evitare falsi "non disponibile"
-    if best_score >= 78:
-        return best_product, alternatives
-
-    # se il nome contiene parole molto indicative accetta anche score medio
-    query = extract_candidate_product_text(user_text)
-    q_words = [w for w in normalize_text(query).split() if len(w) > 3]
-    if q_words:
-        hits = sum(1 for w in q_words if w in best_product["norm_name"])
-        if hits >= max(1, len(q_words) - 1) and best_score >= 68:
-            return best_product, alternatives
-
-    return None, [p for s, p in matches if s >= 58]
-
-
-# =========================
-# STATIC BUSINESS RULES
-# =========================
-def shipping_reply(user_text: str) -> str:
+def fallback_whatsapp_reply(user_text: str = "") -> str:
+    wa = make_whatsapp_message(user_text)
     return (
-        "Per informazioni su spedizione, tracking o stato ordine, "
-        f"ti consiglio di contattare direttamente {WHATSAPP_NAME} su WhatsApp al {WHATSAPP_NUMBER}. "
-        "In questo modo puoi ricevere assistenza più precisa e veloce sul tuo ordine."
+        f"Per questa richiesta ti consiglio di contattare direttamente **{WHATSAPP_LABEL}** su WhatsApp:\n\n"
+        f"[Scrivi su WhatsApp]({wa})"
     )
 
-def operator_reply() -> str:
-    return (
-        f"Per parlare con un operatore ti consiglio di contattare direttamente {WHATSAPP_NAME} "
-        f"su WhatsApp al {WHATSAPP_NUMBER}."
-    )
-
-def fallback_reply() -> str:
-    return (
-        f"Per questa richiesta ti consiglio di contattare direttamente {WHATSAPP_NAME} "
-        f"su WhatsApp al {WHATSAPP_NUMBER}, così puoi ricevere assistenza più precisa."
-    )
-
-
 # =========================
-# LLM PROMPTS
+# CSV LOADING
 # =========================
-STORE_SYSTEM_PROMPT = f"""
-Sei l'assistente clienti di MGFishing, ecommerce italiano di articoli da pesca.
+@st.cache_data(show_spinner=False)
+def load_catalog_from_csv(uploaded_file):
+    df = pd.read_csv(uploaded_file)
 
-Regole fondamentali:
-- Se la richiesta riguarda prodotti, devi basarti prima di tutto sui prodotti/link trovati nel catalogo MGFishing forniti nel contesto.
-- Non dire mai in modo sbrigativo che un prodotto non è disponibile se nel contesto c'è una possibile corrispondenza.
-- Se esiste un link prodotto nel contesto, privilegia SEMPRE il link prodotto diretto rispetto a link categoria.
-- Se la richiesta è generale (montature, tecniche, meteo, consigli pesca), rispondi in modo utile, chiaro e naturale.
-- Non citare altri siti, non inserire fonti, non dire "secondo il sito X".
-- Se l'utente chiede un operatore umano, tracking, spedizione, stato ordine, resi, oppure non sei sicuro della risposta, indirizza a WhatsApp:
-  {WHATSAPP_NAME} - {WHATSAPP_NUMBER}
-- Scrivi in italiano.
-- Tono professionale ma semplice.
-- Non inventare disponibilità certa se non è indicata.
-- Se hai un prodotto compatibile o molto probabile, proponilo con il suo link.
-"""
+    original_columns = list(df.columns)
+    lowered = {c.lower().strip(): c for c in original_columns}
 
-def call_openai_for_product(user_text: str, matched_product: dict | None, alternatives: list[dict]):
-    if not client:
+    # Mappatura flessibile colonne
+    possible_name_cols = ["name", "nome", "product_name", "titolo", "title", "prodotto", "descrizione_breve"]
+    possible_url_cols = ["url", "link", "product_url", "permalink"]
+    possible_desc_cols = ["description", "descrizione", "short_description", "descrizione_breve", "details"]
+    possible_cat_cols = ["category", "categoria", "brand", "marchio", "tipologia"]
+
+    def find_col(candidates):
+        for c in candidates:
+            if c in lowered:
+                return lowered[c]
         return None
 
-    context_lines = []
+    name_col = find_col(possible_name_cols)
+    url_col = find_col(possible_url_cols)
+    desc_col = find_col(possible_desc_cols)
+    cat_col = find_col(possible_cat_cols)
 
-    if matched_product:
-        context_lines.append(
-            f"PRODOTTO PRINCIPALE TROVATO:\n"
-            f"Nome: {matched_product['name']}\n"
-            f"Link: {matched_product['url']}"
+    if not name_col:
+        raise ValueError(
+            "Nel CSV serve almeno una colonna nome prodotto. "
+            "Colonne accettate ad esempio: name, nome, title, product_name."
         )
 
-    if alternatives:
-        alt_text = "\n".join([f"- {p['name']} -> {p['url']}" for p in alternatives[:4]])
-        context_lines.append(f"ALTERNATIVE TROVATE:\n{alt_text}")
+    work = df.copy()
+    work["__name"] = work[name_col].fillna("").astype(str)
+    work["__norm_name"] = work["__name"].apply(normalize_text)
+
+    if url_col:
+        work["__url"] = work[url_col].fillna("").astype(str)
+    else:
+        work["__url"] = ""
+
+    if desc_col:
+        work["__desc"] = work[desc_col].fillna("").astype(str)
+    else:
+        work["__desc"] = ""
+
+    if cat_col:
+        work["__cat"] = work[cat_col].fillna("").astype(str)
+    else:
+        work["__cat"] = ""
+
+    return work, {
+        "name_col": name_col,
+        "url_col": url_col,
+        "desc_col": desc_col,
+        "cat_col": cat_col,
+        "all_columns": original_columns,
+    }
+
+def search_products(df: pd.DataFrame, user_text: str, top_k: int = 5):
+    query = normalize_text(user_text)
+    results = []
+
+    for _, row in df.iterrows():
+        name = row["__norm_name"]
+        desc = normalize_text(row["__desc"])
+        cat = normalize_text(row["__cat"])
+
+        score_name = fuzz.token_set_ratio(query, name)
+        score_partial = fuzz.partial_ratio(query, name)
+        score_desc = fuzz.partial_ratio(query, desc) if desc else 0
+        score_cat = fuzz.partial_ratio(query, cat) if cat else 0
+
+        final_score = max(score_name, score_partial, score_desc, score_cat)
+
+        results.append({
+            "score": final_score,
+            "name": row["__name"],
+            "url": row["__url"],
+            "description": row["__desc"],
+            "category": row["__cat"],
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:top_k]
+
+# =========================
+# OPENAI CALLS
+# =========================
+PRODUCT_SYSTEM_PROMPT = f"""
+Sei l'assistente di MGFishing.
+
+Regole:
+- Se l'utente chiede consigli o informazioni su prodotti, usa SOLO il contesto del CSV fornito.
+- Non inventare prodotti che non sono nel contesto.
+- Non dare link prodotto diretto all'utente.
+- Se l'utente chiede il link o dove acquistarlo, devi dire di contattare {WHATSAPP_LABEL} su WhatsApp e fornire il link WhatsApp.
+- Se hai trovato prodotti compatibili o simili, descrivili in modo utile e sintetico.
+- Scrivi in italiano.
+- Non citare altri siti.
+"""
+
+GENERAL_SYSTEM_PROMPT = f"""
+Sei l'assistente di MGFishing.
+
+Regole:
+- Se l'utente chiede meteo, montature, tecniche, consigli di pesca o informazioni generali, puoi usare la ricerca web.
+- Fornisci una risposta corretta, pratica e chiara.
+- Non citare altri siti.
+- Non scrivere fonti.
+- Non nominare siti esterni.
+- Se non sei sicuro o la richiesta richiede assistenza diretta, indirizza a {WHATSAPP_LABEL} su WhatsApp.
+- Scrivi in italiano.
+"""
+
+def answer_from_products(user_text: str, product_matches: list[dict]) -> str:
+    if not client:
+        top = product_matches[:3]
+        if not top or top[0]["score"] < 55:
+            return fallback_whatsapp_reply(user_text)
+
+        text = "Ho trovato questi prodotti nel catalogo MGFishing:\n\n"
+        for p in top:
+            text += f"- **{p['name']}**"
+            if p["category"]:
+                text += f" — {p['category']}"
+            if p["description"]:
+                short_desc = p["description"][:220].strip()
+                text += f"\n  {short_desc}"
+            text += "\n"
+        text += f"\nPer il link o per maggiori informazioni ti consiglio di contattare **{WHATSAPP_LABEL}**:\n[Scrivi su WhatsApp]({make_whatsapp_message(user_text)})"
+        return text
+
+    catalog_context = "\n\n".join([
+        f"Prodotto: {p['name']}\nCategoria: {p['category']}\nDescrizione: {p['description']}\nURL interno: {p['url']}"
+        for p in product_matches[:5]
+    ])
 
     user_prompt = f"""
-Domanda cliente:
+Richiesta cliente:
 {user_text}
 
-Contesto catalogo MGFishing:
-{chr(10).join(context_lines) if context_lines else "Nessun prodotto trovato con alta certezza."}
+Prodotti trovati nel CSV:
+{catalog_context}
 
 Istruzioni:
-- Se il prodotto principale è presente, rispondi usando quel link.
-- Se ci sono alternative valide, puoi citarle.
-- Non parlare di altri siti.
-- Non essere vago.
-- Se non sei abbastanza sicuro, invita a contattare {WHATSAPP_NAME} su WhatsApp al {WHATSAPP_NUMBER}.
+- Rispondi solo usando questi prodotti.
+- Se l'utente chiede consigli, suggerisci il prodotto o i prodotti più adatti.
+- Se l'utente chiede il link, NON dare il link prodotto: invitalo a contattare {WHATSAPP_LABEL} su WhatsApp usando questo link:
+{make_whatsapp_message(user_text)}
 """
 
     try:
-        resp = client.responses.create(
+        response = client.responses.create(
             model="gpt-4.1-mini",
             input=[
-                {"role": "system", "content": STORE_SYSTEM_PROMPT},
+                {"role": "system", "content": PRODUCT_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
         )
-        return resp.output_text.strip()
+        return response.output_text.strip()
     except Exception:
-        return None
+        return fallback_whatsapp_reply(user_text)
 
-def call_openai_general(user_text: str):
+def answer_general_with_web(user_text: str) -> str:
     if not client:
-        return None
+        return fallback_whatsapp_reply(user_text)
 
     user_prompt = f"""
-Richiesta del cliente:
+Richiesta cliente:
 {user_text}
 
-Rispondi in italiano.
-Puoi rispondere in modo utile e pratico su pesca, montature, meteo, tecniche e consigli generali.
-Non citare fonti o nomi di altri siti.
-Se la richiesta richiede chiaramente assistenza umana o post-vendita, invita a contattare {WHATSAPP_NAME} su WhatsApp al {WHATSAPP_NUMBER}.
+Rispondi in modo utile e pratico.
+Puoi usare la ricerca web.
+Non citare siti esterni.
+Non inserire fonti.
+Se non sei sicuro, invita a contattare {WHATSAPP_LABEL} su WhatsApp:
+{make_whatsapp_message(user_text)}
 """
 
-    # Prima prova con web_search_preview, poi fallback normale
     try:
-        resp = client.responses.create(
+        response = client.responses.create(
             model="gpt-4.1-mini",
             input=[
-                {"role": "system", "content": STORE_SYSTEM_PROMPT},
+                {"role": "system", "content": GENERAL_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
             tools=[{"type": "web_search_preview"}],
             temperature=0.4,
         )
-        text = resp.output_text.strip()
+        text = response.output_text.strip()
         if text:
             return text
     except Exception:
         pass
 
-    try:
-        resp = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[
-                {"role": "system", "content": STORE_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.4,
-        )
-        return resp.output_text.strip()
-    except Exception:
-        return None
-
+    return fallback_whatsapp_reply(user_text)
 
 # =========================
-# MAIN RESPONSE LOGIC
+# MAIN LOGIC
 # =========================
-def generate_reply(user_text: str) -> str:
-    t = normalize_text(user_text)
+def generate_answer(user_text: str, catalog_df: pd.DataFrame | None) -> str:
+    clean = normalize_text(user_text)
 
-    # saluti molto semplici
-    if t in ["ciao", "salve", "buongiorno", "buonasera", "hey", "ehi"]:
+    if clean in ["ciao", "salve", "buongiorno", "buonasera", "hey", "ehi"]:
         return (
-            "Ciao! Benvenuto su MGFishing 🎣\n\n"
-            "Posso aiutarti a trovare prodotti sul nostro sito, consigliarti attrezzatura, "
-            "oppure darti indicazioni su montature, tecniche e pesca."
+            "Ciao! Sono l’assistente MGFishing 🎣\n\n"
+            "Posso aiutarti con:\n"
+            "- consigli sui prodotti\n"
+            "- informazioni generali di pesca\n"
+            "- meteo e montature\n\n"
+            f"Per link prodotto o assistenza diretta puoi contattare **{WHATSAPP_LABEL}** qui:\n"
+            f"[Scrivi su WhatsApp]({make_whatsapp_message()})"
         )
 
-    # operatore umano
-    if likely_operator_request(user_text):
-        return operator_reply()
+    if is_link_request(user_text):
+        return (
+            f"Per il link del prodotto ti consiglio di contattare direttamente **{WHATSAPP_LABEL}** su WhatsApp:\n\n"
+            f"[Scrivi su WhatsApp]({make_whatsapp_message(user_text)})"
+        )
 
-    # spedizioni / tracking / ordine
-    if likely_shipping_request(user_text):
-        return shipping_reply(user_text)
+    if is_product_request(user_text) and catalog_df is not None:
+        matches = search_products(catalog_df, user_text, top_k=5)
+        if matches and matches[0]["score"] >= 45:
+            return answer_from_products(user_text, matches)
+        return fallback_whatsapp_reply(user_text)
 
-    # richieste prodotto
-    if likely_product_question(user_text):
-        matched_product, alternatives = get_best_product_link(user_text)
+    if is_general_info_request(user_text):
+        return answer_general_with_web(user_text)
 
-        # Se abbiamo un match concreto, usiamolo
-        if matched_product:
-            ai_reply = call_openai_for_product(user_text, matched_product, alternatives)
-            if ai_reply:
-                return ai_reply
+    # fallback intelligente
+    if catalog_df is not None:
+        matches = search_products(catalog_df, user_text, top_k=5)
+        if matches and matches[0]["score"] >= 60:
+            return answer_from_products(user_text, matches)
 
-            # fallback semplice senza AI
-            msg = (
-                f"Ho trovato questo prodotto sul sito MGFishing:\n\n"
-                f"**{matched_product['name']}**\n{matched_product['url']}"
-            )
-            if alternatives:
-                msg += "\n\nPotrebbero interessarti anche:\n"
-                for p in alternatives[:3]:
-                    msg += f"- {p['name']} → {p['url']}\n"
-            return msg
-
-        # Se non c'è match forte ma ci sono alternative plausibili
-        if alternatives:
-            ai_reply = call_openai_for_product(user_text, None, alternatives)
-            if ai_reply:
-                return ai_reply
-
-            msg = "Non ho trovato un match perfetto, ma ho trovato questi prodotti simili sul sito MGFishing:\n\n"
-            for p in alternatives[:4]:
-                msg += f"- **{p['name']}**\n  {p['url']}\n"
-            return msg
-
-        return fallback_reply()
-
-    # domande generali pesca / meteo / montature
-    if likely_general_question(user_text):
-        ai_reply = call_openai_general(user_text)
-        if ai_reply:
-            return ai_reply
-        return fallback_reply()
-
-    # fallback finale con AI generale
-    ai_reply = call_openai_general(user_text)
-    if ai_reply:
-        return ai_reply
-
-    return fallback_reply()
-
+    return answer_general_with_web(user_text)
 
 # =========================
-# CHAT UI
+# SIDEBAR
+# =========================
+with st.sidebar:
+    st.header("Catalogo prodotti CSV")
+    uploaded_file = st.file_uploader("Carica il CSV prodotti", type=["csv"])
+
+    catalog_df = None
+    catalog_info = None
+
+    if uploaded_file is not None:
+        try:
+            catalog_df, catalog_info = load_catalog_from_csv(uploaded_file)
+            st.success("CSV caricato correttamente")
+            st.write(f"Colonna nome: **{catalog_info['name_col']}**")
+            if catalog_info["url_col"]:
+                st.write(f"Colonna link: **{catalog_info['url_col']}**")
+            if catalog_info["desc_col"]:
+                st.write(f"Colonna descrizione: **{catalog_info['desc_col']}**")
+            if catalog_info["cat_col"]:
+                st.write(f"Colonna categoria: **{catalog_info['cat_col']}**")
+            st.write(f"Prodotti letti: **{len(catalog_df)}**")
+        except Exception as e:
+            st.error(f"Errore CSV: {e}")
+            catalog_df = None
+    else:
+        st.info("Carica il CSV per attivare i consigli sui prodotti.")
+
+    if not OPENAI_API_KEY:
+        st.warning("Manca OPENAI_API_KEY nei secrets o nelle variabili ambiente.")
+
+# =========================
+# CHAT
 # =========================
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": "Ciao! Sono l’assistente MGFishing 🎣\nPosso aiutarti con prodotti, consigli di pesca, montature e informazioni generali."
+            "content": (
+                "Ciao! Sono il chatbot MGFishing 🎣\n\n"
+                "Posso aiutarti con prodotti, consigli di pesca, meteo e montature.\n"
+                f"Per assistenza diretta puoi scrivere a **{WHATSAPP_LABEL}**:\n"
+                f"[Scrivi su WhatsApp]({make_whatsapp_message()})"
+            )
         }
     ]
 
@@ -519,7 +377,7 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-prompt = st.chat_input("Scrivi qui la tua domanda...")
+prompt = st.chat_input("Scrivi la tua domanda...")
 
 if prompt:
     st.session_state.messages.append({"role": "user", "content": prompt})
@@ -529,23 +387,7 @@ if prompt:
 
     with st.chat_message("assistant"):
         with st.spinner("Sto cercando la risposta migliore..."):
-            reply = generate_reply(prompt)
+            reply = generate_answer(prompt, catalog_df)
             st.markdown(reply)
 
     st.session_state.messages.append({"role": "assistant", "content": reply})
-
-with st.sidebar:
-    st.subheader("Catalogo MGFishing")
-    if st.button("Aggiorna catalogo prodotti"):
-        build_catalog.clear()
-        fetch_sitemap_urls.clear()
-        st.success("Cache catalogo svuotata. Al prossimo messaggio verrà ricaricata.")
-
-    try:
-        catalog = build_catalog()
-        st.caption(f"Prodotti/URL indicizzati: {len(catalog)}")
-    except Exception:
-        st.caption("Catalogo non disponibile al momento.")
-
-    if not OPENAI_API_KEY:
-        st.warning("Manca OPENAI_API_KEY nei secrets o nelle variabili ambiente.")

@@ -363,43 +363,42 @@ def score_candidate(query_norm: str, query_tokens: list, item: dict):
     if not item_norm:
         return 0.0
 
-    # Similarità base
     seq = SequenceMatcher(None, query_norm, item_norm).ratio()
 
-    # Contenimento forte
-    contains_bonus = 0.0
-    if query_norm and query_norm in item_norm:
-        contains_bonus += 0.25
-    if item_norm and item_norm in query_norm and len(item_norm) > 8:
-        contains_bonus += 0.18
-
-    # Overlap token
     qset = set(query_tokens)
     iset = set(item_tokens)
+
     overlap = 0.0
     if qset and iset:
         overlap = len(qset & iset) / max(1, len(qset))
 
-    # Bonus parole numeriche / misure
+    contains_bonus = 0.0
+    if query_norm and query_norm in item_norm:
+        contains_bonus += 0.30
+
+    # bonus forte se tutte le parole importanti della query sono presenti nel titolo prodotto
+    if qset and qset.issubset(iset):
+        contains_bonus += 0.35
+
+    # bonus se almeno 2 token coincidono
+    common_tokens = qset & iset
+    if len(common_tokens) >= 2:
+        contains_bonus += 0.20
+
+    # bonus numeri/misure
     number_bonus = 0.0
     qnums = set(re.findall(r"\d+[.,]?\d*", query_norm))
     inums = set(re.findall(r"\d+[.,]?\d*", item_norm))
     if qnums and inums and qnums & inums:
         number_bonus += 0.10
 
-    # Bonus prime parole
-    start_bonus = 0.0
-    qwords = query_norm.split()
-    iwords = item_norm.split()
-    if qwords and iwords:
-        if qwords[0] == iwords[0]:
-            start_bonus += 0.08
-        if len(qwords) > 1 and len(iwords) > 1 and qwords[:2] == iwords[:2]:
-            start_bonus += 0.08
+    # penalità lieve se è molto lungo e dispersivo
+    length_penalty = 0.0
+    if len(item_tokens) > len(query_tokens) + 5:
+        length_penalty = 0.03
 
-    score = (seq * 0.50) + (overlap * 0.35) + contains_bonus + number_bonus + start_bonus
+    score = (seq * 0.45) + (overlap * 0.35) + contains_bonus + number_bonus - length_penalty
     return round(score, 4)
-
 
 def search_best_products(user_query: str, limit: int = 5):
     products, categories = build_catalog_index()

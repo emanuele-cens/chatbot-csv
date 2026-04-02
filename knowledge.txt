@@ -4,7 +4,7 @@ Tempi di spedizione:
 Spediamo in giornata tutti gli ordini che arrivano entro le 14:30. Gli ordini ricevuti dopo le 14:30 vengono spediti il primo giorno lavorativo successivo.
 
 Costi di spedizione:
-La spedizione costa 9 euro in tutta Italia.
+La spedizione costa 9 euro in tutta Italia per ordini inferiori a 199 euro ed è gratuita per ordini sopra 199 euro.
 
 Corrieri utilizzati:
 Le spedizioni vengono affidate a corriere espresso. Utilizziamo Poste Italiane, SDA, Bartolini, TNT FedEx o UPS, scegliendo di volta in volta il corriere migliore in base alla zona di destinazione.

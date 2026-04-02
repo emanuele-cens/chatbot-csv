@@ -1,536 +1,550 @@
 import os
 import re
-import json
+import math
+import difflib
+from typing import List, Dict, Tuple
+
 import pandas as pd
 import streamlit as st
 from openai import OpenAI
 
+
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(page_title="MGFishing Chatbot", page_icon="🎣", layout="centered")
+st.set_page_config(
+    page_title="MGFishing Chatbot",
+    page_icon="🎣",
+    layout="centered"
+)
 
+MODEL_TEXT = os.getenv("OPENAI_MODEL", "gpt-5.4")
 WHATSAPP_NUMBER = "393494166335"
-WHATSAPP_LINK = f"https://wa.me/{WHATSAPP_NUMBER}"
+WHATSAPP_LINK = f"https://wa.me/{WHATSAPP_NUMBER}?text=Ciao%20Emanuele%2C%20avrei%20bisogno%20di%20assistenza."
 CSV_PATH = "prodotti.csv"
+KNOWLEDGE_PATH = "knowledge.txt"
 
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-
-# Modello per risposte generali
-GENERAL_MODEL = "gpt-5-mini"
-
-# =========================
-# STILI
-# =========================
-st.markdown("""
-<style>
-.block-container {max-width: 900px; padding-top: 2rem; padding-bottom: 2rem;}
-.small-muted {color: #6b7280; font-size: 0.92rem;}
-.whatsapp-box {
-    padding: 12px 14px;
-    border-radius: 12px;
-    background: #f0fdf4;
-    border: 1px solid #bbf7d0;
-    margin-top: 10px;
-}
-.product-card {
-    padding: 14px;
-    border-radius: 14px;
-    border: 1px solid #e5e7eb;
-    background: #ffffff;
-    margin-bottom: 12px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# =========================
-# UTILS
-# =========================
-def normalize_text(text):
-    if text is None:
-        return ""
-    text = str(text).strip().lower()
-    text = text.replace("’", "'")
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"[^a-z0-9àèéìòùçñü\s\-\/\.]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-def tokenize(text):
-    text = normalize_text(text)
-    return [t for t in re.split(r"[\s\-/]+", text) if len(t) > 1]
-
-def safe_str(x):
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-def first_existing_column(df, candidates):
-    cols_norm = {normalize_text(c): c for c in df.columns}
-    for cand in candidates:
-        cand_norm = normalize_text(cand)
-        if cand_norm in cols_norm:
-            return cols_norm[cand_norm]
-
-    for c in df.columns:
-        c_norm = normalize_text(c)
-        for cand in candidates:
-            cand_norm = normalize_text(cand)
-            if cand_norm in c_norm or c_norm in cand_norm:
-                return c
-    return None
-
-def build_whatsapp_message(text="Ciao Emanuele, vorrei assistenza su un prodotto."):
-    from urllib.parse import quote
-    return f"{WHATSAPP_LINK}?text={quote(text)}"
-
-# =========================
-# CARICAMENTO CSV
-# =========================
-@st.cache_data(show_spinner=False)
-def load_catalog():
-    if not os.path.exists(CSV_PATH):
-        return None, "File prodotti.csv non trovato nella root del progetto."
-
-    attempts = [
-        {"sep": ","},
-        {"sep": ";"},
-        {"sep": None, "engine": "python"},
-    ]
-
-    last_error = None
-    for params in attempts:
-        try:
-            df = pd.read_csv(CSV_PATH, **params)
-            if df is not None and len(df.columns) > 0 and len(df) > 0:
-                df.columns = [str(c).strip() for c in df.columns]
-                return df, None
-        except Exception as e:
-            last_error = str(e)
-
-    return None, f"Impossibile leggere prodotti.csv. Errore: {last_error}"
-
-catalog_df, catalog_error = load_catalog()
-
-# =========================
-# PREPARAZIONE CATALOGO
-# =========================
-def prepare_catalog(df):
-    if df is None or df.empty:
-        return None
-
-    name_col = first_existing_column(df, [
-        "nome", "name", "titolo", "title", "prodotto", "product", "nome prodotto"
-    ])
-    desc_col = first_existing_column(df, [
-        "descrizione", "description", "descrizione breve", "short description", "testo"
-    ])
-    brand_col = first_existing_column(df, [
-        "marca", "brand", "produttore", "manufacturer"
-    ])
-    category_col = first_existing_column(df, [
-        "categoria", "category", "famiglia", "reparto"
-    ])
-    price_col = first_existing_column(df, [
-        "prezzo", "price", "prezzo ivato", "final price", "sale price"
-    ])
-    sku_col = first_existing_column(df, [
-        "sku", "reference", "codice", "ean", "id"
-    ])
-    url_col = first_existing_column(df, [
-        "url", "link", "product url", "permalink", "href"
-    ])
-    stock_col = first_existing_column(df, [
-        "stock", "disponibilita", "availability", "qty", "quantita"
-    ])
-
-    prepared = df.copy()
-
-    prepared["_name"] = prepared[name_col].fillna("").astype(str) if name_col else ""
-    prepared["_desc"] = prepared[desc_col].fillna("").astype(str) if desc_col else ""
-    prepared["_brand"] = prepared[brand_col].fillna("").astype(str) if brand_col else ""
-    prepared["_category"] = prepared[category_col].fillna("").astype(str) if category_col else ""
-    prepared["_price"] = prepared[price_col].fillna("").astype(str) if price_col else ""
-    prepared["_sku"] = prepared[sku_col].fillna("").astype(str) if sku_col else ""
-    prepared["_url"] = prepared[url_col].fillna("").astype(str) if url_col else ""
-    prepared["_stock"] = prepared[stock_col].fillna("").astype(str) if stock_col else ""
-
-    prepared["_search_blob"] = (
-        prepared["_name"].fillna("") + " " +
-        prepared["_brand"].fillna("") + " " +
-        prepared["_category"].fillna("") + " " +
-        prepared["_desc"].fillna("") + " " +
-        prepared["_sku"].fillna("")
-    ).astype(str)
-
-    prepared["_search_blob_norm"] = prepared["_search_blob"].apply(normalize_text)
-
-    return prepared
-
-catalog_prepared = prepare_catalog(catalog_df)
-
-# =========================
-# RICONOSCIMENTO INTENTO
-# =========================
-PRODUCT_KEYWORDS = [
-    "prodotto", "prodotti", "canna", "canne", "mulinello", "mulinelli", "trecciato",
-    "nylon", "fluorocarbon", "esca", "esche", "artificiale", "artificiali",
-    "pastura", "bombarda", "galleggiante", "amo", "ami", "girella", "girelle",
-    "finale", "terminale", "combo", "kit", "fishing", "trabucco", "daiwa",
-    "shimano", "colmic", "tubertini", "molix", "rapture", "major craft",
-    "trota", "surfcasting", "bolognese", "feeder", "spinning", "eging", "carpfishing"
-]
-
-LINK_KEYWORDS = [
-    "link", "mandami il link", "invia il link", "dammi il link",
-    "url", "pagina prodotto", "apri prodotto", "scheda prodotto"
-]
-
-GENERAL_WEB_KEYWORDS = [
-    "meteo", "tempo", "vento", "mare", "onde", "pressione", "pioggia",
-    "montatura", "montature", "trave", "terminale", "finale", "innesco",
-    "consiglio", "consigli", "come pescare", "tecnica", "tecniche",
-    "nodo", "nodi", "lancio", "assetto", "mareggiata", "luna", "stagione"
-]
-
-OPERATOR_KEYWORDS = [
-    "operatore", "umano", "persona", "assistenza", "whatsapp", "emanuele", "contatto"
-]
-
-SHIPPING_KEYWORDS = [
-    "spedizione", "tracking", "tracciamento", "ordine", "consegna", "pacco", "corriere"
-]
-
-def contains_any(text, keywords):
-    t = normalize_text(text)
-    return any(normalize_text(k) in t for k in keywords)
-
-def detect_intent(user_text):
-    t = normalize_text(user_text)
-
-    if contains_any(t, OPERATOR_KEYWORDS):
-        return "operator"
-
-    if contains_any(t, LINK_KEYWORDS):
-        return "link"
-
-    if contains_any(t, SHIPPING_KEYWORDS):
-        return "shipping"
-
-    if contains_any(t, GENERAL_WEB_KEYWORDS):
-        return "general_web"
-
-    if contains_any(t, PRODUCT_KEYWORDS):
-        return "product"
-
-    return "general_web"
-
-# =========================
-# MATCH PRODOTTI DA CSV
-# =========================
-def score_product_match(query, row):
-    q_norm = normalize_text(query)
-    q_tokens = set(tokenize(query))
-
-    blob = row["_search_blob_norm"]
-    name_norm = normalize_text(row["_name"])
-    brand_norm = normalize_text(row["_brand"])
-    category_norm = normalize_text(row["_category"])
-
-    score = 0
-
-    if q_norm and q_norm in name_norm:
-        score += 120
-    if q_norm and q_norm in blob:
-        score += 80
-
-    for tok in q_tokens:
-        if tok in name_norm:
-            score += 18
-        elif tok in brand_norm:
-            score += 12
-        elif tok in category_norm:
-            score += 10
-        elif tok in blob:
-            score += 5
-
-    if row["_name"] and normalize_text(row["_name"]).startswith(q_norm[:20]):
-        score += 20
-
-    # Premia brand noti se presenti nella domanda
-    for brand in ["trabucco", "daiwa", "shimano", "colmic", "tubertini", "rapture", "molix", "major craft"]:
-        if brand in q_norm and brand in blob:
-            score += 25
-
-    return score
-
-def search_products(query, df, top_n=5):
-    if df is None or df.empty:
-        return []
-
-    scored = []
-    for idx, row in df.iterrows():
-        score = score_product_match(query, row)
-        if score > 0:
-            scored.append((score, idx, row))
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    # Tieni solo risultati sensati
-    results = []
-    seen = set()
-    for score, idx, row in scored:
-        name = safe_str(row["_name"])
-        if not name:
-            continue
-        key = normalize_text(name)
-        if key in seen:
-            continue
-        seen.add(key)
-        results.append((score, row))
-        if len(results) >= top_n:
-            break
-
-    return results
-
-def format_product_card(row):
-    name = safe_str(row["_name"])
-    brand = safe_str(row["_brand"])
-    category = safe_str(row["_category"])
-    price = safe_str(row["_price"])
-    desc = safe_str(row["_desc"])
-    sku = safe_str(row["_sku"])
-    stock = safe_str(row["_stock"])
-
-    details = []
-    if brand:
-        details.append(f"Marca: {brand}")
-    if category:
-        details.append(f"Categoria: {category}")
-    if price:
-        details.append(f"Prezzo: {price}")
-    if sku:
-        details.append(f"Codice: {sku}")
-    if stock:
-        details.append(f"Disponibilità: {stock}")
-
-    extra = " • ".join(details)
-
-    short_desc = desc[:280].strip()
-    if len(desc) > 280:
-        short_desc += "..."
-
-    html = f"""
-    <div class="product-card">
-        <div><strong>{name}</strong></div>
-        {"<div class='small-muted'>" + extra + "</div>" if extra else ""}
-        {"<div style='margin-top:8px;'>" + short_desc + "</div>" if short_desc else ""}
-    </div>
-    """
-    return html
-
-# =========================
-# RISPOSTE FISSE
-# =========================
-def whatsapp_response(custom_text=None):
-    msg = custom_text or "Ciao Emanuele, vorrei assistenza."
-    link = build_whatsapp_message(msg)
-    return f"""Per assistenza diretta puoi contattare **Emanuele** su WhatsApp:
-
-[{link}]({link})"""
-
-def shipping_response():
-    return f"""Per informazioni su **spedizione, tracking, consegna o stato ordine** ti consiglio di contattare direttamente **Emanuele** su WhatsApp:
-
-[{build_whatsapp_message("Ciao Emanuele, vorrei informazioni su spedizione o tracking del mio ordine.")}]({build_whatsapp_message("Ciao Emanuele, vorrei informazioni su spedizione o tracking del mio ordine.")})"""
-
-def link_response(user_text):
-    link = build_whatsapp_message(f"Ciao Emanuele, mi serve il link del prodotto: {user_text}")
-    return f"""Per ricevere il **link corretto del prodotto** scrivi direttamente a **Emanuele** su WhatsApp:
-
-[{link}]({link})"""
 
 # =========================
 # OPENAI CLIENT
 # =========================
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+@st.cache_resource
+def get_openai_client():
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    return OpenAI(api_key=api_key)
 
-GENERAL_SYSTEM_PROMPT = """
-Sei l'assistente di MGFishing.
 
-Regole obbligatorie:
-- Rispondi sempre in italiano.
-- Quando rispondi a domande generali su pesca, meteo, montature, tecniche e consigli pratici, dai una risposta chiara, utile e concreta.
-- Non citare nomi di siti esterni.
-- Non scrivere frasi tipo "secondo il sito..." o "ho trovato su...".
-- Non inventare prodotti del catalogo MGFishing.
-- Se la richiesta riguarda un prodotto specifico del catalogo, non devi rispondere tu: quella parte viene gestita separatamente.
-- Se la domanda è ambigua o molto specifica e non sei sicuro, invita a contattare Emanuele su WhatsApp al 3494166335.
-- Mantieni tono professionale, utile e commerciale.
-"""
+# =========================
+# HELPERS
+# =========================
+def clean_text(text) -> str:
+    if text is None:
+        return ""
+    text = str(text)
+    text = text.replace("\n", " ").replace("\r", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-def ask_openai_general(question):
-    if not client:
-        return f"""Al momento il servizio AI non è disponibile.
 
-Puoi contattare direttamente **Emanuele** su WhatsApp:
-[{build_whatsapp_message("Ciao Emanuele, vorrei assistenza.")}]({build_whatsapp_message("Ciao Emanuele, vorrei assistenza.")})"""
+def normalize_text(text: str) -> str:
+    text = clean_text(text).lower()
+    text = re.sub(r"[^\w\sàèéìòù]", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def tokenize(text: str) -> List[str]:
+    return [t for t in normalize_text(text).split() if len(t) > 1]
+
+
+def contains_any(text: str, keywords: List[str]) -> bool:
+    text_n = normalize_text(text)
+    return any(k in text_n for k in keywords)
+
+
+def make_whatsapp_message(custom_text: str = "") -> str:
+    if not custom_text:
+        custom_text = "Ciao Emanuele, avrei bisogno di assistenza."
+    custom_text = custom_text.strip()
+    from urllib.parse import quote
+    return f"https://wa.me/{WHATSAPP_NUMBER}?text={quote(custom_text)}"
+
+
+def safe_get(row: Dict, possible_cols: List[str]) -> str:
+    for c in possible_cols:
+        if c in row and pd.notna(row[c]) and str(row[c]).strip():
+            return clean_text(row[c])
+    return ""
+
+
+def detect_column(df: pd.DataFrame, candidates: List[str]) -> str:
+    cols_norm = {c.lower().strip(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in cols_norm:
+            return cols_norm[c.lower()]
+    return ""
+
+
+# =========================
+# LOAD DATA
+# =========================
+@st.cache_data(show_spinner=False)
+def load_catalog() -> pd.DataFrame:
+    if not os.path.exists(CSV_PATH):
+        return pd.DataFrame()
+
+    try:
+        df = pd.read_csv(CSV_PATH, dtype=str, keep_default_na=False)
+    except Exception:
+        try:
+            df = pd.read_csv(CSV_PATH, sep=";", dtype=str, keep_default_na=False)
+        except Exception:
+            return pd.DataFrame()
+
+    if df.empty:
+        return df
+
+    df = df.fillna("")
+
+    name_col = detect_column(df, [
+        "name", "nome", "title", "titolo", "product", "prodotto",
+        "product_name", "nome_prodotto"
+    ])
+    if not name_col:
+        name_col = df.columns[0]
+
+    link_col = detect_column(df, [
+        "link", "url", "product_url", "permalink", "href"
+    ])
+
+    price_col = detect_column(df, [
+        "price", "prezzo", "sale_price", "final_price", "product_price"
+    ])
+
+    category_col = detect_column(df, [
+        "category", "categoria", "categories", "brand_category", "reparto"
+    ])
+
+    brand_col = detect_column(df, [
+        "brand", "marca", "manufacturer", "produttore"
+    ])
+
+    desc_col = detect_column(df, [
+        "description", "descrizione", "short_description", "descrizione_breve"
+    ])
+
+    sku_col = detect_column(df, [
+        "sku", "reference", "codice", "ean", "id_product"
+    ])
+
+    prepared_rows = []
+    for _, row in df.iterrows():
+        row_dict = {c: clean_text(row[c]) for c in df.columns}
+
+        title = safe_get(row_dict, [name_col]) if name_col else ""
+        link = safe_get(row_dict, [link_col]) if link_col else ""
+        price = safe_get(row_dict, [price_col]) if price_col else ""
+        category = safe_get(row_dict, [category_col]) if category_col else ""
+        brand = safe_get(row_dict, [brand_col]) if brand_col else ""
+        desc = safe_get(row_dict, [desc_col]) if desc_col else ""
+        sku = safe_get(row_dict, [sku_col]) if sku_col else ""
+
+        all_text = " ".join([
+            title, category, brand, desc, sku,
+            " ".join([clean_text(v) for v in row_dict.values()])
+        ])
+
+        prepared_rows.append({
+            "_title": title,
+            "_link": link,
+            "_price": price,
+            "_category": category,
+            "_brand": brand,
+            "_desc": desc,
+            "_sku": sku,
+            "_search_blob": normalize_text(all_text),
+            **row_dict
+        })
+
+    return pd.DataFrame(prepared_rows)
+
+
+@st.cache_data(show_spinner=False)
+def load_knowledge() -> str:
+    if not os.path.exists(KNOWLEDGE_PATH):
+        return ""
+    try:
+        with open(KNOWLEDGE_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+CATALOG_DF = load_catalog()
+KNOWLEDGE_TEXT = load_knowledge()
+
+
+# =========================
+# SEARCH PRODUCTS
+# =========================
+PRODUCT_HINT_WORDS = [
+    "mulinello", "canna", "canna da pesca", "trecciato", "monofilo", "filo",
+    "bombarda", "galleggiante", "girella", "amo", "ami", "esca", "esche",
+    "popper", "minnow", "jig", "fluorocarbon", "bolognese", "feeder",
+    "surfcasting", "spinning", "trota", "carpfishing", "carpa", "serra",
+    "palamita", "spigola", "tonnetto", "trabucco", "daiwa", "shimano",
+    "colmic", "tubertini", "major craft", "molix", "yuki", "rapture"
+]
+
+LINK_HINT_WORDS = [
+    "link", "mandami il link", "inviami il link", "url", "pagina prodotto",
+    "scheda prodotto", "contatto operatore", "operatore", "whatsapp"
+]
+
+KNOWLEDGE_HINT_WORDS = [
+    "spedizione", "tracking", "tracciamento", "consegna", "reso", "resi",
+    "rimborso", "pagamento", "pagamenti", "contrassegno", "tempi", "ordine",
+    "ordini", "assistenza", "costo spedizione", "quanto costa la spedizione"
+]
+
+WEB_HINT_WORDS = [
+    "meteo", "vento", "mare", "onde", "pioggia", "pressione", "luna",
+    "fase lunare", "marea", "maree", "montatura", "montature", "trave",
+    "terminali", "bolentino", "surfcasting", "tecnica", "tecniche",
+    "come pescare", "consiglio pesca", "periodo migliore"
+]
+
+
+def score_product_row(query: str, row: pd.Series) -> float:
+    q_norm = normalize_text(query)
+    q_tokens = tokenize(q_norm)
+    if not q_tokens:
+        return 0.0
+
+    title = normalize_text(row.get("_title", ""))
+    category = normalize_text(row.get("_category", ""))
+    brand = normalize_text(row.get("_brand", ""))
+    desc = normalize_text(row.get("_desc", ""))
+    blob = normalize_text(row.get("_search_blob", ""))
+
+    score = 0.0
+
+    for token in q_tokens:
+        if token in title:
+            score += 4.5
+        if token in brand:
+            score += 2.5
+        if token in category:
+            score += 2.2
+        if token in desc:
+            score += 1.2
+        if token in blob:
+            score += 0.8
+
+    phrase_ratio = difflib.SequenceMatcher(None, q_norm, title).ratio()
+    score += phrase_ratio * 6.0
+
+    # bonus se il titolo è molto simile a parte della query
+    short_q = " ".join(q_tokens[:8])
+    title_ratio = difflib.SequenceMatcher(None, short_q, title).ratio()
+    score += title_ratio * 5.0
+
+    return score
+
+
+def search_products(query: str, top_k: int = 8) -> pd.DataFrame:
+    if CATALOG_DF.empty:
+        return pd.DataFrame()
+
+    df = CATALOG_DF.copy()
+    df["_score"] = df.apply(lambda r: score_product_row(query, r), axis=1)
+    df = df.sort_values("_score", ascending=False)
+
+    # filtro minimo
+    df = df[df["_score"] >= 2.4]
+
+    # se query contiene parole prodotto generiche, allarghiamo un po'
+    if df.empty and contains_any(query, PRODUCT_HINT_WORDS):
+        df = CATALOG_DF.copy()
+        df["_score"] = df.apply(lambda r: score_product_row(query, r), axis=1)
+        df = df.sort_values("_score", ascending=False).head(top_k)
+        df = df[df["_score"] >= 1.6]
+
+    return df.head(top_k)
+
+
+def catalog_context_from_df(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return ""
+
+    rows = []
+    for _, row in df.iterrows():
+        rows.append(
+            "\n".join([
+                f"Nome: {clean_text(row.get('_title', ''))}",
+                f"Marca: {clean_text(row.get('_brand', ''))}",
+                f"Categoria: {clean_text(row.get('_category', ''))}",
+                f"Prezzo: {clean_text(row.get('_price', ''))}",
+                f"SKU/Codice: {clean_text(row.get('_sku', ''))}",
+                f"Descrizione: {clean_text(row.get('_desc', ''))}",
+            ])
+        )
+    return "\n\n---\n\n".join(rows)
+
+
+# =========================
+# INTENT
+# =========================
+def detect_intent(user_message: str) -> str:
+    text = normalize_text(user_message)
+
+    if contains_any(text, LINK_HINT_WORDS):
+        return "whatsapp"
+
+    if contains_any(text, KNOWLEDGE_HINT_WORDS):
+        return "knowledge"
+
+    if contains_any(text, WEB_HINT_WORDS):
+        return "web"
+
+    # se ci sono match forti nel catalogo, trattiamo come prodotto
+    matches = search_products(user_message, top_k=5)
+    if not matches.empty:
+        top_score = float(matches.iloc[0]["_score"])
+        if top_score >= 3.2:
+            return "product"
+
+    if contains_any(text, PRODUCT_HINT_WORDS):
+        return "product"
+
+    return "generic"
+
+
+# =========================
+# AI ANSWERS
+# =========================
+def ask_model_plain(system_prompt: str, user_prompt: str) -> str:
+    client = get_openai_client()
+    if client is None:
+        return "Manca la variabile ambiente OPENAI_API_KEY."
 
     try:
         response = client.responses.create(
-            model=GENERAL_MODEL,
+            model=MODEL_TEXT,
             input=[
-                {"role": "system", "content": GENERAL_SYSTEM_PROMPT},
-                {"role": "user", "content": question}
-            ]
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
         )
-        text = getattr(response, "output_text", None)
-        if text and text.strip():
-            return text.strip()
-    except Exception:
-        pass
+        return (response.output_text or "").strip()
+    except Exception as e:
+        return f"Si è verificato un errore OpenAI: {e}"
 
-    return f"""Non sono riuscito a rispondere con precisione.
 
-Puoi contattare direttamente **Emanuele** su WhatsApp:
-[{build_whatsapp_message("Ciao Emanuele, vorrei assistenza su questa richiesta.")}]({build_whatsapp_message("Ciao Emanuele, vorrei assistenza su questa richiesta.")})"""
+def ask_model_with_web(system_prompt: str, user_prompt: str) -> str:
+    client = get_openai_client()
+    if client is None:
+        return "Manca la variabile ambiente OPENAI_API_KEY."
 
-# =========================
-# RISPOSTE SU PRODOTTI DA CSV
-# =========================
-def answer_product_question(user_text):
-    if catalog_prepared is None or catalog_prepared.empty:
-        return {
-            "type": "text",
-            "content": f"""Il catalogo prodotti al momento non è disponibile nell'app.
+    try:
+        response = client.responses.create(
+            model=MODEL_TEXT,
+            tools=[{"type": "web_search"}],
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return (response.output_text or "").strip()
+    except Exception as e:
+        return f"Si è verificato un errore OpenAI: {e}"
 
-Per assistenza diretta puoi scrivere a **Emanuele** su WhatsApp:
-[{build_whatsapp_message("Ciao Emanuele, mi serve aiuto per trovare un prodotto.")}]({build_whatsapp_message("Ciao Emanuele, mi serve aiuto per trovare un prodotto.")})"""
-        }
 
-    matches = search_products(user_text, catalog_prepared, top_n=5)
+def answer_product(user_message: str) -> str:
+    matches = search_products(user_message, top_k=8)
 
-    if not matches:
-        return {
-            "type": "text",
-            "content": f"""Non ho trovato nel catalogo un prodotto chiaramente collegato a questa richiesta.
+    if matches.empty:
+        wa = make_whatsapp_message(
+            f"Ciao Emanuele, sto cercando questo prodotto o un consiglio: {user_message}"
+        )
+        return (
+            "Non riesco a individuare con sicurezza il prodotto nel catalogo MGFishing.\n\n"
+            f"Per assistenza diretta scrivi a Emanuele su WhatsApp:\n{wa}"
+        )
 
-Per una verifica rapida ti consiglio di scrivere a **Emanuele** su WhatsApp:
-[{build_whatsapp_message(f"Ciao Emanuele, sto cercando questo prodotto: {user_text}")}]({build_whatsapp_message(f"Ciao Emanuele, sto cercando questo prodotto: {user_text}")})"""
-        }
+    context = catalog_context_from_df(matches)
 
-    # Se la domanda sembra proprio una richiesta di consiglio
-    advice_prefix = "In base al catalogo MGFishing, questi prodotti sembrano i più adatti alla tua richiesta:"
-    if any(k in normalize_text(user_text) for k in ["consiglia", "consigliami", "quale", "migliore", "adatto", "scegliere"]):
-        advice_prefix = "In base ai prodotti presenti nel catalogo MGFishing, ti consiglierei di valutare questi articoli:"
+    system_prompt = """
+Sei l'assistente di MGFishing.
+Devi aiutare il cliente SOLO usando i prodotti presenti nel contesto catalogo.
+Regole obbligatorie:
+- Non inventare mai prodotti non presenti nel contesto.
+- Non dire mai che un prodotto esiste se non è nel contesto.
+- Se il cliente chiede consigli, proponi solo prodotti presenti nel contesto.
+- Se il cliente chiede un link prodotto, NON dare link prodotto: invita a contattare Emanuele su WhatsApp.
+- Rispondi in italiano, chiaro, utile e commerciale ma naturale.
+- Non citare fonti esterne.
+- Se il contesto è poco chiaro, dillo con onestà e rimanda a WhatsApp.
+- Se nel contesto ci sono più risultati compatibili, suggerisci i più pertinenti e spiega brevemente perché.
+"""
 
-    products = [row for score, row in matches]
-    return {
-        "type": "products",
-        "intro": advice_prefix,
-        "products": products,
-        "footer": f"""Se vuoi il **link esatto del prodotto** o conferma immediata della disponibilità, contatta **Emanuele** su WhatsApp:
-[{build_whatsapp_message(f"Ciao Emanuele, mi serve il link o conferma disponibilità per questo prodotto: {user_text}")}]({build_whatsapp_message(f"Ciao Emanuele, mi serve il link o conferma disponibilità per questo prodotto: {user_text}")})"""
-    }
+    user_prompt = f"""
+Domanda cliente:
+{user_message}
 
-# =========================
-# MOTORE PRINCIPALE
-# =========================
-def generate_answer(user_text):
-    intent = detect_intent(user_text)
+Catalogo disponibile:
+{context}
 
-    if intent == "operator":
-        return {"type": "text", "content": whatsapp_response("Ciao Emanuele, vorrei parlare con un operatore.")}
+Numero WhatsApp Emanuele: 3494166335
+Link WhatsApp: {WHATSAPP_LINK}
 
-    if intent == "link":
-        return {"type": "text", "content": link_response(user_text)}
+Genera una risposta utile e precisa.
+"""
 
-    if intent == "shipping":
-        return {"type": "text", "content": shipping_response()}
+    answer = ask_model_plain(system_prompt, user_prompt)
+
+    if not answer:
+        wa = make_whatsapp_message(
+            f"Ciao Emanuele, avrei bisogno di aiuto per questo prodotto: {user_message}"
+        )
+        return f"Per questo prodotto ti consiglio di contattare Emanuele su WhatsApp:\n{wa}"
+
+    return answer
+
+
+def answer_knowledge(user_message: str) -> str:
+    if not KNOWLEDGE_TEXT.strip():
+        wa = make_whatsapp_message(
+            f"Ciao Emanuele, avrei bisogno di informazioni su: {user_message}"
+        )
+        return (
+            "Al momento non ho il file knowledge.txt disponibile.\n\n"
+            f"Per assistenza scrivi a Emanuele su WhatsApp:\n{wa}"
+        )
+
+    system_prompt = """
+Sei l'assistente clienti di MGFishing.
+Devi rispondere SOLO usando il contenuto del file knowledge fornito.
+Regole:
+- Non inventare informazioni non presenti nel knowledge.
+- Se la risposta è presente nel knowledge, rispondi in modo diretto e autonomo.
+- Non rimandare subito a WhatsApp se la risposta è nel knowledge.
+- Rimanda a WhatsApp solo se nel knowledge non c'è una risposta sufficiente.
+- Rispondi in italiano, in modo chiaro e professionale.
+"""
+
+    user_prompt = f"""
+Domanda cliente:
+{user_message}
+
+Knowledge MGFishing:
+{KNOWLEDGE_TEXT}
+
+Numero WhatsApp Emanuele: 3494166335
+Link WhatsApp: {WHATSAPP_LINK}
+"""
+
+    return ask_model_plain(system_prompt, user_prompt)
+
+
+def answer_web(user_message: str) -> str:
+    system_prompt = """
+Sei l'assistente di MGFishing.
+Puoi cercare sul web per rispondere a domande su pesca, montature, tecniche, meteo pesca, mare, vento, onde, pressione, luna e consigli pratici.
+Regole obbligatorie:
+- Rispondi in italiano.
+- Non mostrare link, fonti, nomi di siti o riferimenti esterni.
+- Se la domanda è sul meteo pesca, interpreta i dati in ottica pesca sportiva.
+- Non parlare da meteorologo generico: collega sempre la risposta alla pescabilità quando opportuno.
+- Se la domanda è su montature o tecniche, rispondi in modo pratico e concreto.
+- Se la domanda chiede di parlare con operatore o è troppo vaga, invita a contattare Emanuele su WhatsApp 3494166335.
+"""
+
+    user_prompt = f"""
+Rispondi alla seguente domanda del cliente in modo pratico, utile e senza citare siti esterni:
+
+{user_message}
+"""
+
+    return ask_model_with_web(system_prompt, user_prompt)
+
+
+def answer_whatsapp(user_message: str) -> str:
+    wa = make_whatsapp_message(f"Ciao Emanuele, avrei bisogno di assistenza su: {user_message}")
+    return (
+        "Per questo ti consiglio di contattare direttamente Emanuele su WhatsApp:\n\n"
+        f"{wa}"
+    )
+
+
+def answer_generic(user_message: str) -> str:
+    # prova prima con catalogo se ci sono match almeno discreti
+    matches = search_products(user_message, top_k=5)
+    if not matches.empty and float(matches.iloc[0]["_score"]) >= 2.7:
+        return answer_product(user_message)
+
+    # prova knowledge
+    if contains_any(user_message, KNOWLEDGE_HINT_WORDS):
+        return answer_knowledge(user_message)
+
+    # fallback web per domande generali pesca
+    return answer_web(user_message)
+
+
+def generate_answer(user_message: str) -> Tuple[str, str]:
+    intent = detect_intent(user_message)
+
+    if intent == "whatsapp":
+        return answer_whatsapp(user_message), intent
+
+    if intent == "knowledge":
+        return answer_knowledge(user_message), intent
+
+    if intent == "web":
+        return answer_web(user_message), intent
 
     if intent == "product":
-        return answer_product_question(user_text)
+        return answer_product(user_message), intent
 
-    if intent == "general_web":
-        text = ask_openai_general(user_text)
+    return answer_generic(user_message), "generic"
 
-        # Se la risposta torna vuota o troppo debole, fallback WhatsApp
-        if not text or len(text.strip()) < 8:
-            text = whatsapp_response("Ciao Emanuele, mi serve assistenza.")
-        return {"type": "text", "content": text}
-
-    return {"type": "text", "content": whatsapp_response("Ciao Emanuele, mi serve assistenza.")}
 
 # =========================
 # UI
 # =========================
-st.title("🎣 MGFishing Chatbot")
-
-st.markdown("""
-Ciao! Sono il chatbot MGFishing 🎣
-
-Posso aiutarti con:
-- consigli sui prodotti presenti nel catalogo
-- meteo, montature e tecniche di pesca
-- assistenza diretta tramite WhatsApp
-""")
-
-if catalog_prepared is not None:
-    st.caption(f"Catalogo collegato: {len(catalog_prepared)} prodotti")
-else:
-    st.caption("Catalogo non disponibile")
+st.title("🎣 Chatbot MGFishing")
+st.caption("Consigli su prodotti, spedizioni, montature e meteo pesca")
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "type": "text",
-            "content": f"""Ciao! Sono l’assistente MGFishing 🎣
-
-Posso aiutarti con prodotti, meteo, montature e consigli di pesca.
-
-Per assistenza diretta puoi scrivere a **Emanuele** su WhatsApp:
-[{build_whatsapp_message("Ciao Emanuele, vorrei assistenza.")}]({build_whatsapp_message("Ciao Emanuele, vorrei assistenza.")})"""
+            "content": (
+                "Ciao! Sono l’assistente MGFishing.\n\n"
+                "Posso aiutarti con:\n"
+                "- consigli sui prodotti presenti nel catalogo\n"
+                "- spedizione, tracking, resi e pagamenti\n"
+                "- montature, tecniche e meteo pesca"
+            )
         }
     ]
 
-# mostra chat
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
-        if msg.get("type") == "products":
-            st.markdown(msg["intro"])
-            for row in msg["products"]:
-                st.markdown(format_product_card(row), unsafe_allow_html=True)
-            st.markdown(msg["footer"])
-        else:
-            st.markdown(msg["content"])
+        st.markdown(msg["content"])
 
-# input
-user_prompt = st.chat_input("Scrivi la tua domanda...")
+user_input = st.chat_input("Scrivi qui la tua domanda...")
 
-if user_prompt:
-    st.session_state.messages.append({
-        "role": "user",
-        "type": "text",
-        "content": user_prompt
-    })
-
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
-        st.markdown(user_prompt)
+        st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        with st.spinner("Sto preparando la risposta..."):
-            answer = generate_answer(user_prompt)
+        with st.spinner("Sto cercando la risposta migliore..."):
+            answer, intent = generate_answer(user_input)
+            st.markdown(answer)
 
-            if answer["type"] == "products":
-                st.markdown(answer["intro"])
-                for row in answer["products"]:
-                    st.markdown(format_product_card(row), unsafe_allow_html=True)
-                st.markdown(answer["footer"])
-            else:
-                st.markdown(answer["content"])
-
-    st.session_state.messages.append({
-        "role": "assistant",
-        **answer
-    })
+    st.session_state.messages.append({"role": "assistant", "content": answer})

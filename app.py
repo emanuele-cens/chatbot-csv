@@ -1,682 +1,611 @@
 import os
 import re
+import json
 import time
 import html
 import math
-import unicodedata
+import queue
 import requests
 import streamlit as st
 import xml.etree.ElementTree as ET
 
+from typing import List, Dict, Any, Tuple, Optional
+from urllib.parse import urljoin, urlparse
 from difflib import SequenceMatcher
-from urllib.parse import urlparse
+
+from bs4 import BeautifulSoup
 from openai import OpenAI
+from duckduckgo_search import DDGS
 
-
-# =========================
+# =========================================================
 # CONFIG
-# =========================
+# =========================================================
+
 SITE_URL = "https://www.mgfishing.eu"
-DEFAULT_SITEMAP = f"{SITE_URL}/sitemap.xml"
-REQUEST_TIMEOUT = 20
-SITEMAP_TTL_SECONDS = 60 * 60 * 6  # 6 ore
-MAX_PRODUCTS_IN_CONTEXT = 8
+SITEMAP_URL = "https://www.mgfishing.eu/sitemap.xml"
+WHATSAPP_NUMBER = "3494166335"
+WHATSAPP_LABEL = "WhatsApp 3494166335 - Emanuele"
 
-# Modello OpenAI
-DEFAULT_MODEL = "gpt-4.1-mini"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-# Alcune parole comuni da ignorare nella ricerca fuzzy
-STOPWORDS = {
-    "il", "lo", "la", "i", "gli", "le", "un", "uno", "una", "di", "a", "da", "in",
-    "con", "su", "per", "tra", "fra", "del", "della", "dello", "dei", "degli", "delle",
-    "al", "allo", "alla", "ai", "agli", "alle", "e", "ed", "o", "oppure", "che",
-    "mi", "mandi", "manda", "dammi", "link", "prodotto", "articolo", "categoria",
-    "vorrei", "cerco", "cerca", "hai", "avete", "mi", "serve", "consiglio", "consigli",
-    "per", "una", "uno", "un", "dello", "della", "delle", "degli"
-}
+# Modello consigliato: puoi cambiarlo se vuoi
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-LINK_REQUEST_HINTS = [
-    "link", "mandami", "manda", "dammi", "url", "pagina prodotto", "pagina", "scheda prodotto"
-]
+# Quanti prodotti massimo caricare dal sito
+MAX_PRODUCTS_TO_INDEX = 4000
 
-GREETING_HINTS = [
-    "ciao", "salve", "buongiorno", "buonasera", "hey", "ehi"
-]
+# Quanti risultati internet usare come contesto
+MAX_WEB_RESULTS = 5
 
+# Timeout richieste
+HTTP_TIMEOUT = 20
 
-# =========================
+# =========================================================
+# REGOLE FISSE DEL NEGOZIO
+# QUI PUOI TENERE LE STESSE REGOLE CHE AVEVAMO GIÀ MESSO
+# =========================================================
+
+SHOP_RULES = """
+Regole del negozio MGFishing:
+
+- Per informazioni su spedizioni, ordini, assistenza e supporto clienti, rispondi in modo chiaro e sintetico.
+- Se il cliente chiede di parlare con un operatore, contattare il negozio o se non sai rispondere con sicurezza, invita sempre a scrivere su WhatsApp al numero 3494166335 chiedendo di Emanuele.
+- Non inventare mai disponibilità, prezzi, tempi o condizioni se non risultano dal contesto disponibile.
+- Se non trovi un prodotto in modo preciso, prova a cercare prodotti molto simili del catalogo e proponi alternative.
+- Non citare mai altri siti web nella risposta al cliente.
+- Quando trovi il link corretto di un prodotto del sito MGFishing, inseriscilo chiaramente in risposta.
+- Se il cliente chiede tracking e non hai dati certi, indirizzalo a WhatsApp 3494166335 - Emanuele.
+- Se il cliente chiede tempi di spedizione, rispondi in linea generale in modo prudente e professionale.
+"""
+
+# =========================================================
 # STREAMLIT PAGE
-# =========================
+# =========================================================
+
 st.set_page_config(
     page_title="MGFishing Assistant",
     page_icon="🎣",
-    layout="centered"
+    layout="wide"
 )
 
 st.title("🎣 MGFishing Assistant")
-st.caption("Ti aiuto a trovare prodotti, link e consigli di pesca sul catalogo MGFishing.")
+st.caption("Consigli sui prodotti MGFishing, tecniche di pesca, meteo e assistenza.")
 
-
-# =========================
+# =========================================================
 # OPENAI CLIENT
-# =========================
-def get_openai_api_key():
-    # Priorità: Streamlit secrets -> environment
-    key = None
+# =========================================================
 
-    try:
-        key = st.secrets.get("OPENAI_API_KEY", None)
-    except Exception:
-        key = None
+def get_openai_client() -> OpenAI:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY non impostata.")
+    return OpenAI(api_key=OPENAI_API_KEY)
 
-    if not key:
-        key = os.getenv("OPENAI_API_KEY")
+# =========================================================
+# TEXT HELPERS
+# =========================================================
 
-    return key
-
-
-def get_openai_model():
-    model = None
-    try:
-        model = st.secrets.get("OPENAI_MODEL", None)
-    except Exception:
-        model = None
-
-    if not model:
-        model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
-
-    return model
-
-
-OPENAI_API_KEY = get_openai_api_key()
-OPENAI_MODEL = get_openai_model()
-
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
-
-# =========================
-# HELPERS
-# =========================
-def strip_accents(text: str) -> str:
-    text = unicodedata.normalize("NFKD", text)
-    return "".join(c for c in text if not unicodedata.combining(c))
-
-
-def normalize_text(text: str) -> str:
+def clean_text(text: str) -> str:
     if not text:
         return ""
     text = html.unescape(text)
-    text = strip_accents(text.lower())
-    text = text.replace("&", " e ")
-    text = re.sub(r"[_\-\/]+", " ", text)
-    text = re.sub(r"[^a-z0-9àèéìòù ]+", " ", text, flags=re.IGNORECASE)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+def normalize_text(text: str) -> str:
+    text = text.lower().strip()
+    text = text.replace("-", " ")
+    text = text.replace("_", " ")
+    text = re.sub(r"[^\w\sàèéìòù]", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-def tokenize(text: str):
-    text = normalize_text(text)
-    tokens = [t for t in text.split() if t and t not in STOPWORDS and len(t) > 1]
-    return tokens
+def similarity(a: str, b: str) -> float:
+    return SequenceMatcher(None, normalize_text(a), normalize_text(b)).ratio()
 
-
-def slug_to_title(url: str) -> str:
-    path = urlparse(url).path.strip("/")
-    if not path:
-        return ""
-
-    last = path.split("/")[-1]
-    last = re.sub(r"\.html?$", "", last, flags=re.IGNORECASE)
-    last = last.replace("-", " ")
-    last = re.sub(r"\s+", " ", last).strip()
-
-    if not last:
-        return ""
-
-    # Miglioro leggibilità
-    return " ".join(word.capitalize() if not re.search(r"\d", word) else word.upper() for word in last.split())
-
-
-def is_likely_product_url(url: str) -> bool:
-    u = url.lower()
-
-    # Escludo aree sicuramente non prodotto
-    excluded = [
-        "/blog", "/content/", "/category", "/categoria", "/cart", "/ordine", "/order",
-        "/login", "/my-account", "/module", "/search", "/sitemap", "/stores", "/contatti",
-        "/chi-siamo", "/privacy", "/cookie", "/new-products", "/best-sales", "/promotions",
-        "/manufacturer", "/brand", "/marche", "/page/"
+def contains_operator_request(user_text: str) -> bool:
+    t = normalize_text(user_text)
+    triggers = [
+        "operatore", "parlare con operatore", "assistenza", "umano",
+        "whatsapp", "contatto", "contattare", "numero", "telefono"
     ]
-    if any(x in u for x in excluded):
-        return False
+    return any(x in t for x in triggers)
 
-    path = urlparse(url).path.strip("/")
-    if not path:
-        return False
+def looks_like_product_question(user_text: str) -> bool:
+    t = normalize_text(user_text)
 
-    # In molti ecommerce prodotto = URL con slug + .html
-    if path.endswith(".html"):
+    product_keywords = [
+        "prodotto", "mulinello", "canna", "trecciato", "monofilo", "esca",
+        "artificiale", "bombarda", "galleggiante", "amo", "girella", "fluorocarbon",
+        "trabucco", "shimano", "daiwa", "tubertini", "colmic", "yuki",
+        "rapala", "major craft", "molix", "fassa", "ryobi", "nomura",
+        "xenos", "caldia", "crossfire", "ballistic", "atmos", "tk4"
+    ]
+
+    generic_non_product = [
+        "meteo", "vento", "onde", "montatura", "terminali", "come pescare",
+        "tecnica", "maree", "pressione", "luna", "licenza", "bollettino"
+    ]
+
+    if any(k in t for k in product_keywords):
         return True
 
-    # Altri casi di slug lungo
-    parts = path.split("/")
-    if len(parts) >= 1 and len(parts[-1]) >= 10 and "-" in parts[-1]:
+    if any(k in t for k in generic_non_product):
+        return False
+
+    # Se sembra richiesta di link prodotto
+    if "link" in t or "url" in t:
         return True
 
     return False
 
+def fallback_operator_message() -> str:
+    return (
+        f"Per assistenza diretta ti consiglio di contattare {WHATSAPP_LABEL}."
+    )
 
-def is_likely_category_url(url: str) -> bool:
-    u = url.lower()
-    hints = ["/categoria", "/category", "/collections", "/shop", "/catalog"]
-    return any(h in u for h in hints)
+# =========================================================
+# SITEMAP + PRODUCT INDEX
+# =========================================================
 
-
-def safe_get(url: str):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; MGFishingBot/1.0)"
-    }
-    r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
+def download_xml(url: str) -> str:
+    r = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
-    return r
+    return r.text
 
-
-def parse_xml_urls(xml_text: str):
+def parse_sitemap_urls(xml_text: str) -> List[str]:
     urls = []
     try:
         root = ET.fromstring(xml_text)
+        ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+        # sitemap index
+        sitemap_locs = root.findall(".//sm:sitemap/sm:loc", ns)
+        if sitemap_locs:
+            return [loc.text.strip() for loc in sitemap_locs if loc.text]
+
+        # urlset
+        url_locs = root.findall(".//sm:url/sm:loc", ns)
+        if url_locs:
+            return [loc.text.strip() for loc in url_locs if loc.text]
     except Exception:
-        return urls
+        pass
+    return urls
 
-    ns = {"sm": "http://www.sitemaps.org/schemas/sitemap/0.9"}
-
-    # urlset
-    for loc in root.findall(".//sm:url/sm:loc", ns):
-        if loc.text:
-            urls.append(loc.text.strip())
-
-    # sitemapindex
-    for loc in root.findall(".//sm:sitemap/sm:loc", ns):
-        if loc.text:
-            urls.append(loc.text.strip())
-
-    # fallback senza namespace
-    if not urls:
-        for loc in root.findall(".//loc"):
-            if loc.text:
-                urls.append(loc.text.strip())
-
-    return list(dict.fromkeys(urls))
-
-
-@st.cache_data(ttl=SITEMAP_TTL_SECONDS, show_spinner=False)
-def discover_all_urls():
-    """
-    Carica sitemap principale e, se presente, le sitemap figlie.
-    Restituisce una lista unica di URL.
-    """
-    collected = []
-    seen = set()
-    queue = [DEFAULT_SITEMAP]
-
-    while queue:
-        current = queue.pop(0)
-        if current in seen:
-            continue
-        seen.add(current)
-
-        try:
-            r = safe_get(current)
-            urls = parse_xml_urls(r.text)
-        except Exception:
-            continue
-
-        # Se sono URL di altre sitemap, mettili in coda
-        child_sitemaps = [u for u in urls if "sitemap" in u.lower() and u.lower().endswith(".xml")]
-        page_urls = [u for u in urls if u not in child_sitemaps]
-
-        collected.extend(page_urls)
-
-        for sm in child_sitemaps:
-            if sm not in seen:
-                queue.append(sm)
-
-        # Evito loop esagerati
-        if len(seen) > 50:
-            break
-
-    return list(dict.fromkeys(collected))
-
-
-@st.cache_data(ttl=SITEMAP_TTL_SECONDS, show_spinner=False)
-def build_catalog_index():
-    urls = discover_all_urls()
-
-    products = []
-    categories = []
-
-    for url in urls:
-        if not url.startswith(SITE_URL):
-            continue
-
-        title = slug_to_title(url)
-        normalized_title = normalize_text(title)
-        tokens = tokenize(title)
-
-        item = {
-            "url": url,
-            "title": title if title else url,
-            "norm": normalized_title,
-            "tokens": tokens,
-            "path": urlparse(url).path.lower()
-        }
-
-        if is_likely_product_url(url):
-            products.append(item)
-        elif is_likely_category_url(url):
-            categories.append(item)
-
-    # Se prodotti troppo pochi, prendo anche URL con slug lunghi
-    if len(products) < 100:
-        for url in urls:
-            if not url.startswith(SITE_URL):
-                continue
-            if any(p["url"] == url for p in products):
-                continue
-
-            path = urlparse(url).path.strip("/")
-            if path and "-" in path and len(path) >= 10:
-                title = slug_to_title(url)
-                products.append({
-                    "url": url,
-                    "title": title if title else url,
-                    "norm": normalize_text(title),
-                    "tokens": tokenize(title),
-                    "path": urlparse(url).path.lower()
-                })
-
-    # Rimuovo duplicati
-    unique_products = {}
-    for p in products:
-        unique_products[p["url"]] = p
-
-    unique_categories = {}
-    for c in categories:
-        unique_categories[c["url"]] = c
-
-    return list(unique_products.values()), list(unique_categories.values())
-
-
-def extract_quoted_text(query: str):
-    matches = re.findall(r'"([^"]+)"|“([^”]+)”|\'([^\']+)\'', query)
-    for tpl in matches:
-        for x in tpl:
-            if x and x.strip():
-                return x.strip()
-    return None
-
-
-def clean_product_query(query: str):
-    q = normalize_text(query)
-
-    # Se ci sono virgolette, uso prima quel contenuto
-    quoted = extract_quoted_text(query)
-    if quoted:
-        return normalize_text(quoted)
-
-    # Rimuovo frasi comuni
-    patterns = [
-        r"\bmandami il link di\b",
-        r"\bmandami il link del\b",
-        r"\bmandami il link della\b",
-        r"\bmanda il link di\b",
-        r"\bmanda il link del\b",
-        r"\bmanda il link della\b",
-        r"\bdammi il link di\b",
-        r"\bdammi il link del\b",
-        r"\bdammi il link della\b",
-        r"\bcerco il link di\b",
-        r"\bcerco il link del\b",
-        r"\bcerco il link della\b",
-        r"\bmi mandi il link di\b",
-        r"\bmi mandi il link del\b",
-        r"\bmi mandi il link della\b",
-        r"\blink prodotto\b",
-        r"\bpagina prodotto\b",
-        r"\bprodotto\b",
-        r"\barticolo\b",
-        r"\blink\b",
-        r"\burl\b",
+def is_product_url(url: str) -> bool:
+    u = url.lower()
+    # Adatta ai pattern più comuni di PrestaShop / shop
+    product_signals = [
+        "/",
+    ]
+    bad_signals = [
+        "/category", "/categoria", "/blog", "/content", "/login",
+        "/carrello", "/cart", "/ordine", "/checkout", "/module"
     ]
 
-    for p in patterns:
-        q = re.sub(p, " ", q)
+    if any(x in u for x in bad_signals):
+        return False
 
-    q = re.sub(r"\s+", " ", q).strip()
-    return q
+    # Molti PrestaShop usano URL con id-nome-prodotto oppure slug prodotto
+    # Qui filtriamo in modo ampio
+    path = urlparse(url).path.strip("/")
+    if not path:
+        return False
+    if path.count("/") > 2:
+        return False
 
+    return True
 
-def score_candidate(query_norm: str, query_tokens: list, item: dict):
-    item_norm = item["norm"]
-    item_tokens = item["tokens"]
+def extract_candidate_product_sitemaps(sitemap_urls: List[str]) -> List[str]:
+    preferred = []
+    for url in sitemap_urls:
+        lu = url.lower()
+        if "product" in lu or "prodot" in lu:
+            preferred.append(url)
+    if preferred:
+        return preferred
+    return sitemap_urls
 
-    if not item_norm:
-        return 0.0
-
-    seq = SequenceMatcher(None, query_norm, item_norm).ratio()
-
-    qset = set(query_tokens)
-    iset = set(item_tokens)
-
-    overlap = 0.0
-    if qset and iset:
-        overlap = len(qset & iset) / max(1, len(qset))
-
-    contains_bonus = 0.0
-    if query_norm and query_norm in item_norm:
-        contains_bonus += 0.30
-
-    # bonus forte se tutte le parole importanti della query sono presenti nel titolo prodotto
-    if qset and qset.issubset(iset):
-        contains_bonus += 0.35
-
-    # bonus se almeno 2 token coincidono
-    common_tokens = qset & iset
-    if len(common_tokens) >= 2:
-        contains_bonus += 0.20
-
-    # bonus numeri/misure
-    number_bonus = 0.0
-    qnums = set(re.findall(r"\d+[.,]?\d*", query_norm))
-    inums = set(re.findall(r"\d+[.,]?\d*", item_norm))
-    if qnums and inums and qnums & inums:
-        number_bonus += 0.10
-
-    # penalità lieve se è molto lungo e dispersivo
-    length_penalty = 0.0
-    if len(item_tokens) > len(query_tokens) + 5:
-        length_penalty = 0.03
-
-    score = (seq * 0.45) + (overlap * 0.35) + contains_bonus + number_bonus - length_penalty
-    return round(score, 4)
-
-def search_best_products(user_query: str, limit: int = 5):
-    products, categories = build_catalog_index()
-
-    cleaned = clean_product_query(user_query)
-    query_norm = normalize_text(cleaned)
-    query_tokens = tokenize(cleaned)
-
-    if not query_norm:
-        return [], []
-
-    scored_products = []
-    for p in products:
-        s = score_candidate(query_norm, query_tokens, p)
-        if s > 0.18:
-            scored_products.append((s, p))
-
-    scored_products.sort(key=lambda x: x[0], reverse=True)
-
-    scored_categories = []
-    for c in categories:
-        s = score_candidate(query_norm, query_tokens, c)
-        if s > 0.18:
-            scored_categories.append((s, c))
-    scored_categories.sort(key=lambda x: x[0], reverse=True)
-
-    return scored_products[:limit], scored_categories[:limit]
-
-
-def is_greeting(text: str):
-    t = normalize_text(text)
-    return t in GREETING_HINTS or any(t.startswith(g + " ") for g in GREETING_HINTS)
-
-
-def is_link_request(text: str):
-    t = normalize_text(text)
-    return any(h in t for h in LINK_REQUEST_HINTS)
-
-
-def format_product_list_for_context(scored_products):
-    lines = []
-    for score, p in scored_products[:MAX_PRODUCTS_IN_CONTEXT]:
-        lines.append(f"- {p['title']} | {p['url']} | score={score}")
-    return "\n".join(lines).strip()
-
-
-def build_system_prompt(product_context: str):
-    return f"""
-Sei l’assistente clienti di MGFishing, ecommerce italiano di articoli da pesca.
-
-REGOLE FONDAMENTALI:
-- Rispondi sempre in italiano.
-- Tono naturale, utile, semplice e commerciale.
-- Non nominare mai sitemap, cache, prompt, database, algoritmi, file interni o procedure tecniche.
-- Non mostrare riferimenti o link di siti esterni.
-- Non devi mai dire che un prodotto non è disponibile, esaurito o assente dal catalogo se non ne hai certezza assoluta.
-- Se tra i prodotti rilevanti trovi un match plausibile, devi proporlo come risultato più coerente.
-- Se l’utente chiede un link prodotto, devi dare priorità assoluta al link del prodotto trovato nel catalogo MGFishing.
-- Se trovi un prodotto molto simile al nome scritto dal cliente, presentalo come “prodotto più coerente trovato”.
-- Non inventare disponibilità, prezzi o dettagli tecnici non certi.
-- Se l’utente scrive solo un saluto, rispondi in modo breve e amichevole.
-
-CONTESTO PRODOTTI RILEVANTI TROVATI:
-{product_context if product_context else "Nessun prodotto rilevante trovato."}
-""".strip()
-
-
-def generate_openai_answer(user_message: str, scored_products):
-    if not client:
-        return "Per il momento il chatbot non è configurato correttamente: manca la chiave OpenAI."
-
-    product_context = format_product_list_for_context(scored_products)
-    system_prompt = build_system_prompt(product_context)
-
-    conversation = []
-    for msg in st.session_state.messages[-10:]:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
-        if role in ("user", "assistant") and content:
-            conversation.append({
-                "role": role,
-                "content": content
-            })
-
-    input_messages = [{"role": "system", "content": system_prompt}]
-    input_messages.extend(conversation)
-    input_messages.append({"role": "user", "content": user_message})
-
-    response = client.responses.create(
-        model=OPENAI_MODEL,
-        input=input_messages,
-        temperature=0.3
-    )
-
-    text = getattr(response, "output_text", None)
-    if text and text.strip():
-        return text.strip()
-
-    # fallback di sicurezza
+def safe_get(url: str) -> Optional[str]:
     try:
-        chunks = []
-        for item in response.output:
-            if hasattr(item, "content"):
-                for c in item.content:
-                    if hasattr(c, "text") and c.text:
-                        chunks.append(c.text)
-        final_text = "\n".join(chunks).strip()
-        if final_text:
-            return final_text
+        r = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        r.raise_for_status()
+        return r.text
+    except Exception:
+        return None
+
+def extract_product_data_from_html(url: str, html_text: str) -> Dict[str, Any]:
+    soup = BeautifulSoup(html_text, "html.parser")
+
+    title = ""
+    meta_desc = ""
+    body_text = ""
+
+    if soup.title and soup.title.text:
+        title = clean_text(soup.title.text)
+
+    meta = soup.find("meta", attrs={"name": "description"})
+    if meta and meta.get("content"):
+        meta_desc = clean_text(meta.get("content"))
+
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        title = clean_text(h1.get_text(" ", strip=True)) or title
+
+    body_candidates = []
+
+    selectors = [
+        "article",
+        "#content",
+        ".product-information",
+        ".product-description",
+        ".product-details",
+        ".page-content",
+        "main"
+    ]
+
+    for sel in selectors:
+        for node in soup.select(sel):
+            txt = clean_text(node.get_text(" ", strip=True))
+            if len(txt) > 80:
+                body_candidates.append(txt)
+
+    if body_candidates:
+        body_text = max(body_candidates, key=len)
+    else:
+        body_text = clean_text(soup.get_text(" ", strip=True))
+
+    # JSON-LD
+    product_name = ""
+    try:
+        scripts = soup.find_all("script", type="application/ld+json")
+        for s in scripts:
+            content = s.string or s.get_text()
+            if not content:
+                continue
+            data = json.loads(content)
+            data_list = data if isinstance(data, list) else [data]
+            for item in data_list:
+                if isinstance(item, dict) and item.get("@type") == "Product":
+                    product_name = clean_text(item.get("name", ""))
+                    if product_name:
+                        title = product_name
     except Exception:
         pass
 
-    return "Si è verificato un problema nella generazione della risposta. Riprova tra poco."
+    text_for_search = clean_text(f"{title}. {meta_desc}. {body_text}")
 
+    return {
+        "title": title or urlparse(url).path.strip("/").replace("-", " "),
+        "url": url,
+        "description": meta_desc,
+        "content": text_for_search[:4000]
+    }
 
-def deterministic_link_answer(user_message: str):
-    scored_products, scored_categories = search_best_products(user_message, limit=5)
+@st.cache_data(ttl=60 * 60 * 6, show_spinner=True)
+def build_product_index() -> List[Dict[str, Any]]:
+    all_products: List[Dict[str, Any]] = []
 
-    best_product = scored_products[0] if scored_products else None
-    best_category = scored_categories[0] if scored_categories else None
+    sitemap_xml = download_xml(SITEMAP_URL)
+    sitemap_urls = parse_sitemap_urls(sitemap_xml)
 
-    if best_product:
-        product_score, product = best_product
-        category_score = best_category[0] if best_category else 0.0
+    if not sitemap_urls:
+        return []
 
-        # se il prodotto è migliore della categoria, restituisci SEMPRE il prodotto
-        if product_score >= 0.48 and product_score >= category_score:
-            return (
-                f"Certo, ecco il prodotto più coerente che ho trovato:\n\n"
-                f"**{product['title']}**\n"
-                f"{product['url']}"
-            )
+    candidate_sitemaps = extract_candidate_product_sitemaps(sitemap_urls)
 
-        # se ci sono più prodotti plausibili
-        if len(scored_products) >= 2 and product_score >= 0.40:
-            lines = ["Ho trovato questi risultati molto simili:"]
-            for score, p in scored_products[:3]:
-                lines.append(f"- **{p['title']}**\n  {p['url']}")
-            return "\n\n".join(lines)
+    collected_urls: List[str] = []
 
-    if best_category and best_category[0] >= 0.58:
-        c = best_category[1]
-        return (
-            f"Non ho trovato con certezza il prodotto esatto, ma questa è la pagina più vicina che ho trovato:\n\n"
-            f"**{c['title']}**\n"
-            f"{c['url']}"
+    for sm_url in candidate_sitemaps:
+        sm_xml = safe_get(sm_url)
+        if not sm_xml:
+            continue
+
+        nested_urls = parse_sitemap_urls(sm_xml)
+        if not nested_urls:
+            continue
+
+        for u in nested_urls:
+            if is_product_url(u):
+                collected_urls.append(u)
+
+    # Rimuovi duplicati
+    seen = set()
+    final_urls = []
+    for u in collected_urls:
+        if u not in seen:
+            seen.add(u)
+            final_urls.append(u)
+
+    final_urls = final_urls[:MAX_PRODUCTS_TO_INDEX]
+
+    for url in final_urls:
+        html_text = safe_get(url)
+        if not html_text:
+            continue
+        try:
+            product = extract_product_data_from_html(url, html_text)
+            if product.get("title"):
+                all_products.append(product)
+        except Exception:
+            continue
+
+    return all_products
+
+def score_product(product: Dict[str, Any], query: str) -> float:
+    query_n = normalize_text(query)
+    title_n = normalize_text(product.get("title", ""))
+    content_n = normalize_text(product.get("content", ""))
+
+    score = 0.0
+
+    # Match titolo forte
+    title_sim = similarity(query, product.get("title", ""))
+    score += title_sim * 0.55
+
+    # Bonus se tutte/parziali parole del query nel titolo
+    words = [w for w in query_n.split() if len(w) > 2]
+    if words:
+        title_hits = sum(1 for w in words if w in title_n)
+        content_hits = sum(1 for w in words if w in content_n)
+
+        score += min(title_hits / max(len(words), 1), 1.0) * 0.30
+        score += min(content_hits / max(len(words), 1), 1.0) * 0.15
+
+    # Bonus se query intera nel titolo
+    if query_n and query_n in title_n:
+        score += 0.25
+
+    return score
+
+def find_best_products(query: str, products: List[Dict[str, Any]], top_k: int = 5) -> List[Dict[str, Any]]:
+    scored = []
+    for p in products:
+        s = score_product(p, query)
+        if s > 0.15:
+            scored.append((s, p))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored[:top_k]]
+
+def extract_product_name_candidate(user_text: str) -> str:
+    # Prova a ripulire frasi tipo "mi mandi il link del trabucco xenos sw"
+    t = clean_text(user_text)
+    patterns = [
+        r"link del(?:la|lo)?\s+(.+)",
+        r"link prodotto\s+(.+)",
+        r"mi mandi il link di\s+(.+)",
+        r"cerco\s+(.+)",
+        r"hai\s+(.+)",
+        r"informazioni su\s+(.+)",
+    ]
+    for p in patterns:
+        m = re.search(p, t, flags=re.IGNORECASE)
+        if m:
+            return clean_text(m.group(1))
+    return t
+
+# =========================================================
+# WEB SEARCH (NO REFERENCES IN FINAL ANSWER)
+# =========================================================
+
+@st.cache_data(ttl=60 * 30, show_spinner=False)
+def web_search_context(query: str, max_results: int = MAX_WEB_RESULTS) -> List[Dict[str, str]]:
+    results = []
+    try:
+        with DDGS() as ddgs:
+            items = list(ddgs.text(query, region="it-it", safesearch="moderate", max_results=max_results))
+            for item in items:
+                results.append({
+                    "title": clean_text(item.get("title", "")),
+                    "body": clean_text(item.get("body", "")),
+                    "href": item.get("href", "")
+                })
+    except Exception:
+        return []
+    return results
+
+# =========================================================
+# INTENT LOGIC
+# =========================================================
+
+def build_product_context(user_text: str, products: List[Dict[str, Any]]) -> Tuple[str, List[Dict[str, Any]]]:
+    candidate = extract_product_name_candidate(user_text)
+    best = find_best_products(candidate, products, top_k=5)
+
+    if not best:
+        best = find_best_products(user_text, products, top_k=5)
+
+    if not best:
+        return "", []
+
+    lines = []
+    for i, p in enumerate(best, start=1):
+        lines.append(
+            f"[PRODOTTO {i}]\n"
+            f"Titolo: {p.get('title', '')}\n"
+            f"URL: {p.get('url', '')}\n"
+            f"Descrizione: {p.get('description', '')}\n"
+            f"Contenuto: {p.get('content', '')[:1200]}\n"
         )
 
-    return (
-        "Non sono riuscito a identificare con sicurezza il prodotto esatto. "
-        "Scrivimi il nome in modo leggermente più completo e ti mando il link corretto."
+    return "\n\n".join(lines), best
+
+def build_web_context(user_text: str) -> str:
+    results = web_search_context(user_text, MAX_WEB_RESULTS)
+    if not results:
+        return ""
+    lines = []
+    for i, r in enumerate(results, start=1):
+        lines.append(
+            f"[RISULTATO WEB {i}]\n"
+            f"Titolo: {r['title']}\n"
+            f"Testo: {r['body']}\n"
+        )
+    return "\n\n".join(lines)
+
+# =========================================================
+# OPENAI RESPONSE
+# =========================================================
+
+def generate_answer(
+    user_text: str,
+    products: List[Dict[str, Any]],
+    chat_history: List[Dict[str, str]]
+) -> str:
+    if contains_operator_request(user_text):
+        return fallback_operator_message()
+
+    is_product = looks_like_product_question(user_text)
+
+    product_context, matched_products = build_product_context(user_text, products)
+    web_context = ""
+
+    if is_product:
+        # Se è domanda prodotto, lavora prima col sito
+        # Solo se il contesto è troppo scarso, il modello può comunque rispondere prudentemente
+        pass
+    else:
+        web_context = build_web_context(user_text)
+
+    system_prompt = f"""
+Sei l'assistente clienti di MGFishing.
+
+OBIETTIVO:
+- Aiutare il cliente a scegliere prodotti del catalogo MGFishing.
+- Rispondere a domande generali di pesca, montature, tecniche, meteo e consigli usando il contesto web se disponibile.
+- NON devi mai citare o nominare altri siti nella risposta finale.
+- Se viene chiesto un prodotto e trovi un link prodotto corretto del sito MGFishing, devi inserirlo chiaramente.
+- Se non trovi il prodotto esatto ma trovi prodotti molto simili, proponi alternative del catalogo MGFishing.
+- Se non sai rispondere con sufficiente sicurezza, oppure il cliente chiede un operatore, devi rispondere invitando a contattare {WHATSAPP_LABEL}.
+- Non inventare mai dati certi che non hai.
+- Se la domanda riguarda prodotti, dai priorità assoluta al catalogo MGFishing.
+- Se la domanda riguarda consigli generali, montature, meteo, tecniche o informazioni di pesca, puoi usare il contesto web ma non devi citare fonti esterne.
+- Se parli di spedizioni, tracking o assistenza, segui le regole del negozio qui sotto.
+
+REGOLE NEGOZIO:
+{SHOP_RULES}
+
+STILE RISPOSTA:
+- Scrivi in italiano.
+- Tono professionale, semplice, utile e commerciale.
+- Risposta concreta, non troppo lunga.
+- Se consigli un prodotto, spiega brevemente perché.
+- Se c'è un link prodotto MGFishing, scrivilo su una riga separata con prefisso: "Link prodotto:".
+"""
+
+    user_prompt = f"""
+CHAT PRECEDENTE:
+{json.dumps(chat_history[-8:], ensure_ascii=False)}
+
+DOMANDA CLIENTE:
+{user_text}
+
+TIPO DOMANDA:
+{"PRODOTTO / CATALOGO" if is_product else "CONSIGLIO GENERALE / WEB"}
+
+CONTESTO PRODOTTI MGFISHING:
+{product_context if product_context else "Nessun prodotto trovato con sufficiente confidenza."}
+
+CONTESTO WEB:
+{web_context if web_context else "Nessun contesto web disponibile o non necessario."}
+
+ISTRUZIONI IMPORTANTI:
+- Se la domanda è su un prodotto, usa soprattutto il contesto prodotti.
+- Se hai trovato uno o più prodotti adatti, dai il consiglio usando quelli.
+- Se il cliente chiede un link di un prodotto specifico e lo trovi, fornisci il link più pertinente.
+- Se hai trovato solo categorie o risultati vaghi, NON fingere che sia il prodotto esatto.
+- Se non sei sicuro, invita a contattare {WHATSAPP_LABEL}.
+- Non menzionare mai altri siti web.
+"""
+
+    client = get_openai_client()
+
+    response = client.responses.create(
+        model=OPENAI_MODEL,
+        input=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3
     )
 
-def maybe_add_catalog_links_to_answer(answer: str, user_message: str):
-    # Se l'utente non ha chiesto un link, ma possiamo allegare 1-2 prodotti pertinenti, lo facciamo
-    scored_products, _ = search_best_products(user_message, limit=3)
-
-    if not scored_products:
-        return answer
-
-    # Evito di aggiungere se la risposta contiene già link MGFishing
-    if SITE_URL in answer:
-        return answer
-
-    strong = [x for x in scored_products if x[0] >= 0.62]
-    medium = [x for x in scored_products if x[0] >= 0.52]
-
-    picks = strong[:2] if strong else medium[:2]
-    if not picks:
-        return answer
-
-    lines = [answer.strip(), "", "Prodotti MGFishing collegati alla tua richiesta:"]
-    for _, p in picks:
-        lines.append(f"- **{p['title']}**\n  {p['url']}")
-    return "\n".join(lines)
-
-
-def answer_user(user_message: str):
-    user_message = user_message.strip()
-
-    if not user_message:
-        return "Scrivimi pure cosa stai cercando e ti aiuto subito."
-
-    if is_greeting(user_message):
-        return "Ciao 👋 Benvenuto su MGFishing! Dimmi pure cosa stai cercando e ti aiuto con consigli o link prodotto."
-
-    if is_link_request(user_message):
-        return deterministic_link_answer(user_message)
-
-    # Ricerca prodotti pertinenti da passare al modello
-    scored_products, _ = search_best_products(user_message, limit=8)
-
-    # Se la richiesta sembra proprio il nome di un prodotto, provo prima una risposta deterministica
-    cleaned = clean_product_query(user_message)
-    if len(cleaned.split()) >= 2 and len(cleaned) >= 8:
-        if scored_products and scored_products[0][0] >= 0.74:
-            p = scored_products[0][1]
-            # Se il messaggio sembra una ricerca secca di un prodotto, posso essere diretto
-            if len(normalize_text(user_message).split()) <= 7:
-                return (
-                    f"Ti lascio direttamente il prodotto che ho trovato più coerente:\n\n"
-                    f"**{p['title']}**\n"
-                    f"{p['url']}"
-                )
-
-    ai_answer = generate_openai_answer(user_message, scored_products)
-    ai_answer = maybe_add_catalog_links_to_answer(ai_answer, user_message)
-    return ai_answer
-
-
-# =========================
-# SIDEBAR
-# =========================
-with st.sidebar:
-    st.subheader("Impostazioni")
-
-    if OPENAI_API_KEY:
-        st.success("OpenAI collegato")
-    else:
-        st.error("Manca OPENAI_API_KEY")
-
-    st.write(f"Modello: `{OPENAI_MODEL}`")
-
-    if st.button("Aggiorna catalogo ora"):
-        build_catalog_index.clear()
-        discover_all_urls.clear()
-        _ = build_catalog_index()
-        st.success("Catalogo aggiornato.")
-
+    answer = ""
     try:
-        products, categories = build_catalog_index()
-        st.caption(f"Prodotti indicizzati: {len(products)}")
-        st.caption(f"Categorie indicizzate: {len(categories)}")
+        answer = response.output_text.strip()
     except Exception:
-        st.caption("Catalogo non disponibile al momento.")
+        answer = str(response)
 
+    answer = clean_text(answer)
 
-# =========================
-# CHAT STATE
-# =========================
+    if not answer:
+        return fallback_operator_message()
+
+    # Sicurezza finale: se il modello parla di fonti o siti esterni, pulisci un po'
+    banned_phrases = [
+        "secondo il sito",
+        "come riportato da",
+        "fonte",
+        "fonti",
+        "ho trovato su",
+        "sito web"
+    ]
+    lower_answer = answer.lower()
+    if any(bp in lower_answer for bp in banned_phrases):
+        # risposta prudente
+        return fallback_operator_message()
+
+    return answer
+
+# =========================================================
+# UI CHAT
+# =========================================================
+
 if "messages" not in st.session_state:
     st.session_state.messages = [
         {
             "role": "assistant",
-            "content": "Ciao 👋 Sono l’assistente MGFishing. Posso aiutarti a trovare prodotti, link e consigli di pesca."
+            "content": "Ciao! Sono l’assistente MGFishing. Posso aiutarti a scegliere prodotti, darti consigli di pesca o indirizzarti all’assistenza."
         }
     ]
 
+with st.sidebar:
+    st.subheader("Impostazioni")
+    auto_load = st.checkbox("Carica catalogo prodotti del sito", value=True)
+    st.markdown(f"**Sito:** {SITE_URL}")
+    st.markdown(f"**Assistenza:** {WHATSAPP_LABEL}")
 
-# =========================
-# RENDER CHAT
-# =========================
+products_data: List[Dict[str, Any]] = []
+
+if auto_load:
+    try:
+        with st.spinner("Sto caricando il catalogo prodotti MGFishing..."):
+            products_data = build_product_index()
+    except Exception as e:
+        st.warning("Non sono riuscito a caricare il catalogo prodotti in questo momento.")
+        products_data = []
+
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
+user_input = st.chat_input("Scrivi qui la tua domanda...")
 
-# =========================
-# INPUT
-# =========================
-prompt = st.chat_input("Scrivi qui la tua domanda...")
-
-if prompt:
-    st.session_state.messages.append({"role": "user", "content": prompt})
+if user_input:
+    st.session_state.messages.append({"role": "user", "content": user_input})
 
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(user_input)
 
     with st.chat_message("assistant"):
-        with st.spinner("Sto cercando la soluzione migliore..."):
+        with st.spinner("Sto scrivendo la risposta..."):
             try:
-                reply = answer_user(prompt)
-            except Exception as e:
-                reply = (
-                    "C’è stato un problema temporaneo. "
-                    "Riprova tra poco oppure scrivimi il nome del prodotto in modo più preciso."
+                answer = generate_answer(
+                    user_text=user_input,
+                    products=products_data,
+                    chat_history=st.session_state.messages
                 )
+            except Exception:
+                answer = fallback_operator_message()
 
-        st.markdown(reply)
-
-    st.session_state.messages.append({"role": "assistant", "content": reply})
+            st.markdown(answer)
+            st.session_state.messages.append({"role": "assistant", "content": answer})

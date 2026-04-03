@@ -312,7 +312,6 @@ WEB_ADVICE_WORDS = {
     "spiaggia", "scaduta", "acqua velata", "acqua torbida", "mareggiata",
     "previsioni", "previsione", "swell", "moto ondoso", "umidita", "umidità"
 }
-}
 
 STOPWORDS = {
     "mi", "puoi", "potresti", "vorrei", "voglio", "consigliami", "consiglia", "consiglio",

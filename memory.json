@@ -1,47 +1,22 @@
 {
-  "product_links": [
+  "global_rules": [
+    "Non proporre prodotti con prezzo uguale a 0",
+    "Non proporre prodotti con categoria Home",
+    "Non proporre prodotti non pertinenti alla richiesta",
+    "Se l'utente chiede un link prodotto, cercare prima il prodotto esatto e non la categoria",
+    "Se non sei sicuro del prodotto esatto, dillo chiaramente"
+  ],
+  "bad_examples": [
     {
-      "name": "Trabucco Xenos SW",
-      "url": "",
-      "aliases": [
-        "xenos sw",
-        "trabucco xenos sw",
-        "mulinello trabucco xenos sw"
-      ]
+      "user_request": "Dammi un prodotto preciso",
+      "wrong_reply": "Totanara profondità sele octopus hook, Maver Fluo Aminos Water Smoke, Maver Drilla Hookbaits 8mm, Okuma Flite Surf, NOMURA MOMOKO",
+      "lesson": "La risposta era poco pertinente. Non proporre prodotti casuali, non proporre categoria Home, non proporre prezzo 0."
     }
   ],
-  "faq": [
-    {
-      "question": "quali metodi di pagamento accettate",
-      "answer": "Puoi verificare i metodi di pagamento disponibili direttamente durante il checkout sul sito. Per un aiuto immediato puoi contattarci anche su WhatsApp."
-    },
-    {
-      "question": "in quanto spedite",
-      "answer": "Gli ordini vengono gestiti rapidamente. Per urgenze o richieste particolari puoi contattarci su WhatsApp."
-    }
+  "link_rules": [
+    "Preferire sempre il link del prodotto esatto se disponibile",
+    "Non dare il link categoria se esiste il prodotto specifico"
   ],
-  "rules": [
-    "Quando l'utente chiede un link prodotto, dare il link esatto del prodotto se presente in memory.json.",
-    "Non inventare mai link prodotto.",
-    "Se non trovi il prodotto preciso, non dare il link della categoria come se fosse il prodotto.",
-    "Per domande su ordini, problemi o casi particolari, invita a contattare WhatsApp.",
-    "Rispondi in modo semplice, utile e commerciale."
-  ],
-  "aliases": [
-    {
-      "term": "trota lago",
-      "synonyms": [
-        "tremarella",
-        "trout area",
-        "pesca trota lago"
-      ]
-    },
-    {
-      "term": "mulinello",
-      "synonyms": [
-        "reel",
-        "bobina"
-      ]
-    }
-  ]
+  "manual_faq": [],
+  "training_notes": []
 }

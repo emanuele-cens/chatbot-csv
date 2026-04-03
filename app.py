@@ -305,7 +305,13 @@ WEB_ADVICE_WORDS = {
     "meteo", "vento", "mare", "onde", "marea", "pressione", "pioggia", "temperatura",
     "montatura", "montature", "trave", "finale", "terminale", "terminali", "innesco",
     "come pescare", "quando pescare", "pesca", "orario migliore", "luna", "corrente",
-    "spiaggia", "scaduta", "acqua velata", "acqua torbida", "mareggiata"
+    "spiaggia", "scaduta", "acqua velata", "acqua torbida", "mareggiata" 
+    "meteo", "vento", "mare", "onde", "marea", "pressione", "pioggia", "temperatura",
+    "montatura", "montature", "trave", "finale", "terminale", "terminali", "innesco",
+    "come pescare", "quando pescare", "pesca", "orario migliore", "luna", "corrente",
+    "spiaggia", "scaduta", "acqua velata", "acqua torbida", "mareggiata",
+    "previsioni", "previsione", "swell", "moto ondoso", "umidita", "umidità"
+}
 }
 
 STOPWORDS = {
@@ -331,6 +337,38 @@ def detect_intent(query: str) -> str:
     if contains_any(q, PRODUCT_HINTS):
         return "product_advice"
     return "generic"
+
+def web_advice_response(query: str) -> str:
+    manual = check_manual_faq(query)
+    if manual:
+        return manual
+
+    if client is None:
+        return "Al momento il servizio AI non è disponibile."
+
+    system_prompt = (
+        "Sei un assistente esperto di pesca di MGFishing.\n"
+        "Per domande su meteo, vento, mare, onde, pressione, luna e condizioni pesca, "
+        "usa la ricerca web per ottenere informazioni aggiornate.\n"
+        "Interpreta sempre la richiesta in ottica pesca pratica.\n"
+        "Non citare siti esterni per nome nella risposta finale.\n"
+        "Non dire che hai usato strumenti o ricerca web.\n"
+        "Rispondi in italiano, in modo chiaro e utile.\n"
+        "Se mancano dettagli come località o giorno, dallo notare ma prova comunque a dare una risposta utile."
+    )
+
+    user_prompt = f"Domanda cliente: {query}"
+
+    try:
+        response = client.responses.create(
+            model="gpt-4.1-mini",
+            instructions=system_prompt,
+            input=user_prompt,
+            tools=[{"type": "web_search"}]
+        )
+        return response.output_text.strip()
+    except Exception as e:
+        return f"Al momento non riesco a recuperare informazioni aggiornate dal web. Errore: {str(e)}"
 
 
 # =========================================================

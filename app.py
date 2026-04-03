@@ -18,12 +18,34 @@ st.set_page_config(page_title="MGFishing Chatbot", page_icon="🎣", layout="cen
 CSV_PATH = "prodotti.csv"
 KNOWLEDGE_PATH = "knowledge.txt"
 MEMORY_PATH = "memory.json"
+
 WHATSAPP_NUMBER = "393494166335"
-WHATSAPP_LABEL = "MGFishing"
-ADMIN_MODE = True  # METTI False QUANDO IL BOT SARA' USATO DAI CLIENTI
+WHATSAPP_LABEL = "Emanuele"
 
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# =========================================================
+# DEFAULT MEMORY
+# =========================================================
+DEFAULT_MEMORY = {
+    "global_rules": [
+        "Non proporre prodotti con prezzo uguale a 0",
+        "Non proporre prodotti con categoria Home",
+        "Non proporre prodotti non pertinenti alla richiesta",
+        "Se l'utente chiede un link prodotto, cercare prima il prodotto esatto e non la categoria",
+        "Se non sei sicuro del prodotto esatto, dillo chiaramente"
+    ],
+    "bad_examples": [],
+    "link_rules": [
+        "Preferire sempre il link del prodotto esatto se disponibile",
+        "Non dare il link categoria se esiste il prodotto specifico"
+    ],
+    "manual_faq": [],
+    "training_notes": []
+}
+
 
 # =========================================================
 # UTILS
@@ -33,7 +55,7 @@ def normalize_text(text: str) -> str:
     text = unicodedata.normalize("NFKD", text)
     text = "".join(c for c in text if not unicodedata.combining(c))
     text = text.replace("&", " e ")
-    text = re.sub(r"[^a-z0-9àèéìòù\s€.,:/_-]", " ", text)
+    text = re.sub(r"[^a-z0-9àèéìòù\s€.,:/_+-]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -75,68 +97,74 @@ def contains_any(text: str, words) -> bool:
     return any(normalize_text(w) in t for w in words)
 
 
-def ensure_file(path: str, default_content: str) -> None:
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(default_content)
+def short_text(text: str, max_len: int = 300) -> str:
+    text = str(text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len].rsplit(" ", 1)[0] + "..."
 
 
 # =========================================================
-# DEFAULT FILES
+# MEMORY
 # =========================================================
-DEFAULT_MEMORY = {
-    "product_links": [
-        {
-            "name": "Trabucco Xenos SW",
-            "url": "",
-            "aliases": ["xenos sw", "trabucco xenos sw", "mulinello trabucco xenos sw"]
-        }
-    ],
-    "faq": [
-        {
-            "question": "quali metodi di pagamento accettate",
-            "answer": "Puoi verificare i metodi di pagamento disponibili direttamente durante il checkout sul sito. Per un aiuto immediato puoi contattarci anche su WhatsApp."
-        },
-        {
-            "question": "in quanto spedite",
-            "answer": "Gli ordini vengono gestiti rapidamente. Per urgenze o richieste particolari puoi contattarci su WhatsApp."
-        }
-    ],
-    "rules": [
-        "Quando l'utente chiede un link prodotto, dare il link esatto del prodotto se presente in memory.json.",
-        "Non inventare mai link prodotto.",
-        "Se non trovi il prodotto preciso, non dare il link della categoria come se fosse il prodotto.",
-        "Per domande su ordini, problemi o casi particolari, invita a contattare WhatsApp.",
-        "Rispondi in modo semplice, utile e commerciale."
-    ],
-    "aliases": [
-        {
-            "term": "trota lago",
-            "synonyms": ["tremarella", "trout area", "pesca trota lago"]
-        },
-        {
-            "term": "mulinello",
-            "synonyms": ["reel", "bobina"]
-        }
-    ]
-}
+def ensure_memory_file():
+    if not os.path.exists(MEMORY_PATH):
+        with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+            json.dump(DEFAULT_MEMORY, f, ensure_ascii=False, indent=2)
 
-DEFAULT_KNOWLEDGE = """Benvenuto su MGFishing.
 
-Informazioni negozio:
-- Per assistenza rapida puoi contattarci su WhatsApp.
-- Per ordini particolari, problemi o richieste specifiche il contatto diretto è consigliato.
-- Aggiorna questo file con le tue vere informazioni su spedizioni, pagamenti, resi e assistenza.
-"""
+def load_memory() -> Dict[str, Any]:
+    ensure_memory_file()
+    try:
+        with open(MEMORY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return DEFAULT_MEMORY.copy()
+        for k, v in DEFAULT_MEMORY.items():
+            if k not in data:
+                data[k] = v
+        return data
+    except Exception:
+        return DEFAULT_MEMORY.copy()
 
-DEFAULT_CSV = """name,description,price,url,category,brand
-Trabucco Xenos SW,Mulinello per spinning potente e pesche gravose,,,Mulinelli,Trabucco
-Daiwa Salty Pop 95 F,Esca artificiale topwater popper floating 16.5g 9.5cm,,,Artificiali,Daiwa
-"""
 
-ensure_file(MEMORY_PATH, json.dumps(DEFAULT_MEMORY, ensure_ascii=False, indent=2))
-ensure_file(KNOWLEDGE_PATH, DEFAULT_KNOWLEDGE)
-ensure_file(CSV_PATH, DEFAULT_CSV)
+def save_memory(data: Dict[str, Any]):
+    with open(MEMORY_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def add_training_note(user_request: str, wrong_reply: str, lesson: str):
+    memory = load_memory()
+    memory.setdefault("bad_examples", []).append({
+        "user_request": user_request.strip(),
+        "wrong_reply": wrong_reply.strip(),
+        "lesson": lesson.strip()
+    })
+    save_memory(memory)
+
+
+def add_global_rule(rule: str):
+    rule = rule.strip()
+    if not rule:
+        return
+    memory = load_memory()
+    if rule not in memory.setdefault("global_rules", []):
+        memory["global_rules"].append(rule)
+    save_memory(memory)
+
+
+def add_manual_faq(question: str, answer: str):
+    question = question.strip()
+    answer = answer.strip()
+    if not question or not answer:
+        return
+    memory = load_memory()
+    memory.setdefault("manual_faq", []).append({
+        "question": question,
+        "answer": answer
+    })
+    save_memory(memory)
+
 
 # =========================================================
 # LOAD FILES
@@ -236,6 +264,7 @@ def load_catalog(csv_path: str) -> pd.DataFrame:
     return std
 
 
+@st.cache_data(show_spinner=False)
 def load_knowledge(path: str) -> str:
     if not os.path.exists(path):
         return ""
@@ -243,37 +272,27 @@ def load_knowledge(path: str) -> str:
         return f.read().strip()
 
 
-def load_memory(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return DEFAULT_MEMORY
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        for key in ["product_links", "faq", "rules", "aliases"]:
-            if key not in data or not isinstance(data[key], list):
-                data[key] = []
-        return data
-    except Exception:
-        return DEFAULT_MEMORY
-
-
-def save_memory(path: str, data: Dict[str, Any]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
 catalog_df = load_catalog(CSV_PATH)
 knowledge_text = load_knowledge(KNOWLEDGE_PATH)
-memory_data = load_memory(MEMORY_PATH)
 
 # =========================================================
 # KEYWORDS / INTENT
 # =========================================================
 GREETING_WORDS = {"ciao", "salve", "buongiorno", "buonasera", "hey"}
+
 LINK_WORDS = {
     "link", "mandami il link", "inviami il link", "url", "pagina prodotto",
     "scheda prodotto", "apri prodotto", "dove lo trovo", "dammi il link"
 }
+
+PRODUCT_HINTS = {
+    "canna", "canne", "mulinello", "mulinelli", "trecciato", "monofilo", "fluorocarbon",
+    "bombarda", "galleggiante", "guadino", "artificiale", "artificiali", "esca", "esche",
+    "jig", "popper", "minnow", "feeder", "surfcasting", "spinning", "trota", "bolognese",
+    "eging", "bolentino", "ledgering", "carpfishing", "ami", "amo", "girelle", "piombi",
+    "kit", "combo", "totanara", "totanare", "polpara", "polpare"
+}
+
 STORE_INFO_WORDS = {
     "spedizione", "spedizioni", "tracking", "tracciamento", "consegna", "consegne",
     "ordine", "stato ordine", "tempi di spedizione", "resi", "reso",
@@ -281,19 +300,14 @@ STORE_INFO_WORDS = {
     "contrassegno", "carta", "paypal", "bonifico", "assistenza", "whatsapp",
     "tempo di consegna", "quanto costa la spedizione", "costo spedizione"
 }
-PRODUCT_HINTS = {
-    "canna", "canne", "mulinello", "mulinelli", "trecciato", "monofilo", "fluorocarbon",
-    "bombarda", "galleggiante", "guadino", "artificiale", "artificiali", "esca", "esche",
-    "jig", "popper", "minnow", "feeder", "surfcasting", "spinning", "trota", "bolognese",
-    "eging", "bolentino", "ledgering", "carpfishing", "ami", "amo", "girelle", "piombi",
-    "kit", "combo"
-}
+
 WEB_ADVICE_WORDS = {
     "meteo", "vento", "mare", "onde", "marea", "pressione", "pioggia", "temperatura",
     "montatura", "montature", "trave", "finale", "terminale", "terminali", "innesco",
     "come pescare", "quando pescare", "pesca", "orario migliore", "luna", "corrente",
     "spiaggia", "scaduta", "acqua velata", "acqua torbida", "mareggiata"
 }
+
 STOPWORDS = {
     "mi", "puoi", "potresti", "vorrei", "voglio", "consigliami", "consiglia", "consiglio",
     "una", "uno", "dei", "delle", "per", "da", "di", "su", "con", "e", "o", "il", "lo",
@@ -302,69 +316,25 @@ STOPWORDS = {
     "circa", "sui", "sul", "euro", "prezzo", "budget", "adatta", "adatto", "cerco", "cercando"
 }
 
-# =========================================================
-# MEMORY SEARCH
-# =========================================================
-def apply_aliases(query: str, aliases: List[Dict[str, Any]]) -> str:
+
+def detect_intent(query: str) -> str:
     q = normalize_text(query)
-    for item in aliases:
-        term = normalize_text(item.get("term", ""))
-        synonyms = [normalize_text(x) for x in item.get("synonyms", [])]
-        for syn in synonyms:
-            if syn and syn in q:
-                q = q.replace(syn, term)
-    return q
 
+    if q in GREETING_WORDS:
+        return "greeting"
+    if contains_any(q, LINK_WORDS):
+        return "product_link"
+    if contains_any(q, STORE_INFO_WORDS):
+        return "store_info"
+    if contains_any(q, WEB_ADVICE_WORDS):
+        return "web_advice"
+    if contains_any(q, PRODUCT_HINTS):
+        return "product_advice"
+    return "generic"
 
-def score_text_match(query: str, target: str) -> float:
-    q_tokens = set(tokenize(query))
-    t_tokens = set(tokenize(target))
-    if not q_tokens or not t_tokens:
-        return 0.0
-    common = q_tokens.intersection(t_tokens)
-    score = len(common) * 10
-    if normalize_text(target) in normalize_text(query):
-        score += 30
-    return float(score)
-
-
-def find_memory_product_link(query: str, memory: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    q = apply_aliases(query, memory.get("aliases", []))
-    best_item = None
-    best_score = 0.0
-
-    for item in memory.get("product_links", []):
-        name = item.get("name", "")
-        aliases = item.get("aliases", [])
-        url = str(item.get("url", "")).strip()
-        if not url:
-            continue
-
-        targets = [name] + aliases
-        item_score = max(score_text_match(q, t) for t in targets if str(t).strip()) if targets else 0.0
-        if item_score > best_score:
-            best_score = item_score
-            best_item = item
-
-    return best_item if best_score >= 20 else None
-
-
-def find_memory_faq(query: str, memory: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    q = apply_aliases(query, memory.get("aliases", []))
-    best_item = None
-    best_score = 0.0
-
-    for item in memory.get("faq", []):
-        question = item.get("question", "")
-        item_score = score_text_match(q, question)
-        if item_score > best_score:
-            best_score = item_score
-            best_item = item
-
-    return best_item if best_score >= 20 else None
 
 # =========================================================
-# PRODUCT SEARCH
+# CATALOG SEARCH
 # =========================================================
 def extract_budget(query: str):
     q = normalize_text(query)
@@ -388,6 +358,7 @@ def extract_budget(query: str):
 def expand_query_tokens(query: str) -> List[str]:
     toks = [t for t in tokenize(query) if t not in STOPWORDS]
     out = list(toks)
+
     synonyms = {
         "trota": ["trout", "area", "tremarella"],
         "surfcasting": ["surf", "beach", "ledgering"],
@@ -399,26 +370,78 @@ def expand_query_tokens(query: str) -> List[str]:
         "mulinelli": ["mulinello", "reel"],
         "artificiale": ["artificiali", "minnow", "popper", "jig"],
         "artificiali": ["artificiale", "minnow", "popper", "jig"],
+        "totanara": ["totanare", "egi", "squid"],
+        "totanare": ["totanara", "egi", "squid"]
     }
+
     for t in list(toks):
         out.extend(synonyms.get(t, []))
+
     return unique_preserve(out)
 
 
+def is_valid_product_row(row: pd.Series) -> bool:
+    category = normalize_text(row.get("category", ""))
+    price_num = row.get("price_num", None)
+    name = normalize_text(row.get("name", ""))
+
+    if not name:
+        return False
+    if category == "home":
+        return False
+    if price_num is not None and pd.notna(price_num) and float(price_num) <= 0:
+        return False
+    return True
+
+
+def exact_name_match(query: str, df: pd.DataFrame) -> pd.DataFrame:
+    qn = normalize_text(query)
+    if not qn or df.empty:
+        return pd.DataFrame()
+
+    temp = df.copy()
+    temp = temp[temp.apply(is_valid_product_row, axis=1)].copy()
+
+    exact = temp[temp["name_norm"] == qn].copy()
+    if not exact.empty:
+        return exact.head(5)
+
+    contains = temp[temp["name_norm"].str.contains(re.escape(qn), na=False)].copy()
+    if not contains.empty:
+        contains["score"] = 100
+        return contains.sort_values("name_norm").head(5)
+
+    return pd.DataFrame()
+
+
 def score_product(row: pd.Series, query: str, tokens: List[str], budget=None) -> float:
+    if not is_valid_product_row(row):
+        return -9999
+
     name = row["name_norm"]
     text = row["all_text"]
+    desc = row["desc_norm"]
     score = 0.0
 
     for tok in tokens:
         if tok in name:
-            score += 10
+            score += 14
+        elif tok in desc:
+            score += 6
         elif tok in text:
             score += 4
 
     qn = normalize_text(query)
-    if qn and qn in text:
-        score += 20
+
+    if qn and qn == name:
+        score += 100
+    elif qn and qn in name:
+        score += 35
+    elif qn and qn in text:
+        score += 15
+
+    matched_tokens = sum(1 for tok in tokens if tok in text)
+    score += matched_tokens * 2
 
     price = row.get("price_num")
     if budget is not None and price is not None and pd.notna(price):
@@ -433,13 +456,13 @@ def score_product(row: pd.Series, query: str, tokens: List[str], budget=None) ->
         if re.search(r"\bcanna\b|\bcanne\b|\brod\b", text):
             score += 10
         else:
-            score -= 20
+            score -= 25
 
     if "mulinello" in qn or "mulinelli" in qn:
         if re.search(r"\bmulinello\b|\bmulinelli\b|\breel\b", text):
             score += 10
         else:
-            score -= 20
+            score -= 25
 
     return score
 
@@ -448,19 +471,31 @@ def search_products(query: str, df: pd.DataFrame, top_k: int = 5) -> pd.DataFram
     if df.empty:
         return pd.DataFrame()
 
+    exact = exact_name_match(query, df)
+    if not exact.empty:
+        return exact.head(top_k).copy()
+
     tokens = expand_query_tokens(query)
     budget = extract_budget(query)
 
     temp = df.copy()
+    temp = temp[temp.apply(is_valid_product_row, axis=1)].copy()
+    if temp.empty:
+        return pd.DataFrame()
+
     temp["score"] = temp.apply(lambda row: score_product(row, query, tokens, budget), axis=1)
 
     qn = normalize_text(query)
 
     if "canna" in qn or "canne" in qn:
-        temp = temp[temp["all_text"].str.contains(r"\bcanna\b|\bcanne\b|\brod\b", regex=True, na=False)].copy()
+        filtered = temp[temp["all_text"].str.contains(r"\bcanna\b|\bcanne\b|\brod\b", regex=True, na=False)].copy()
+        if not filtered.empty:
+            temp = filtered
 
     if "mulinello" in qn or "mulinelli" in qn:
-        temp = temp[temp["all_text"].str.contains(r"\bmulinello\b|\bmulinelli\b|\breel\b", regex=True, na=False)].copy()
+        filtered = temp[temp["all_text"].str.contains(r"\bmulinello\b|\bmulinelli\b|\breel\b", regex=True, na=False)].copy()
+        if not filtered.empty:
+            temp = filtered
 
     if budget is not None:
         under = temp[(temp["price_num"].notna()) & (temp["price_num"] <= budget * 1.10)].copy()
@@ -468,13 +503,34 @@ def search_products(query: str, df: pd.DataFrame, top_k: int = 5) -> pd.DataFram
             temp = under
 
     temp = temp.sort_values(by="score", ascending=False)
-    temp = temp[temp["score"] > 0]
+    temp = temp[temp["score"] > 8]
+
     return temp.head(top_k).copy()
+
+
+def format_product_cards(results: pd.DataFrame, show_links: bool = False) -> str:
+    parts = []
+    for _, row in results.iterrows():
+        txt = f"**{row.get('name', '')}**\n"
+        if str(row.get("price", "")).strip():
+            txt += f"Prezzo: {row.get('price', '')}\n"
+        if str(row.get("category", "")).strip():
+            txt += f"Categoria: {row.get('category', '')}\n"
+        if str(row.get("brand", "")).strip():
+            txt += f"Marca: {row.get('brand', '')}\n"
+        desc = short_text(row.get("description", ""), 180)
+        if desc:
+            txt += f"{desc}\n"
+        if show_links and str(row.get("url", "")).strip():
+            txt += f"[Apri prodotto]({row.get('url', '')})\n"
+        parts.append(txt.strip())
+    return "\n\n---\n\n".join(parts)
+
 
 # =========================================================
 # OPENAI
 # =========================================================
-def ask_openai(system_prompt: str, user_prompt: str, temperature: float = 0.25) -> str:
+def ask_openai(system_prompt: str, user_prompt: str, temperature: float = 0.2) -> str:
     if client is None:
         return "Al momento il servizio AI non è disponibile."
     try:
@@ -486,10 +542,52 @@ def ask_openai(system_prompt: str, user_prompt: str, temperature: float = 0.25) 
                 {"role": "user", "content": user_prompt},
             ],
         )
-        content = response.choices[0].message.content
-        return content.strip() if content else "Al momento non riesco a generare una risposta corretta."
-    except Exception:
-        return "Al momento non riesco a generare una risposta corretta."
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Al momento non riesco a generare una risposta corretta. Errore: {str(e)}"
+
+
+# =========================================================
+# MEMORY HELPERS
+# =========================================================
+def check_manual_faq(query: str) -> Optional[str]:
+    memory = load_memory()
+    qn = normalize_text(query)
+
+    for item in memory.get("manual_faq", []):
+        qq = normalize_text(item.get("question", ""))
+        if qq and (qq == qn or qq in qn or qn in qq):
+            return item.get("answer", "").strip()
+
+    return None
+
+
+def memory_rules_text() -> str:
+    memory = load_memory()
+    lines = []
+
+    rules = memory.get("global_rules", [])
+    if rules:
+        lines.append("REGOLE GLOBALI:")
+        for r in rules:
+            lines.append(f"- {r}")
+
+    bads = memory.get("bad_examples", [])[-10:]
+    if bads:
+        lines.append("\nERRORI DA NON RIPETERE:")
+        for b in bads:
+            lines.append(f"- Richiesta: {b.get('user_request', '')}")
+            lines.append(f"  Errore: {b.get('wrong_reply', '')}")
+            lines.append(f"  Lezione: {b.get('lesson', '')}")
+
+    link_rules = memory.get("link_rules", [])
+    if link_rules:
+        lines.append("\nREGOLE LINK:")
+        for r in link_rules:
+            lines.append(f"- {r}")
+
+    return "\n".join(lines).strip()
+
 
 # =========================================================
 # RESPONSES
@@ -499,82 +597,95 @@ def greeting_response() -> str:
         "Ciao! Sono l’assistente MGFishing 🎣\n\n"
         "Posso aiutarti con:\n"
         "- consigli sui prodotti del catalogo\n"
-        "- link prodotti salvati in memoria\n"
-        "- pagamenti, spedizioni e info negozio\n"
+        "- link ai prodotti quando disponibili\n"
+        "- spedizioni, pagamenti, tracking e info negozio\n"
         "- montature e consigli di pesca"
     )
 
 
-def product_link_response(query: str, memory: Dict[str, Any], df: pd.DataFrame) -> str:
-    mem_match = find_memory_product_link(query, memory)
-    if mem_match:
-        return f"Ecco il link del prodotto:\n\n{mem_match['url']}"
-
+def product_link_response(query: str, df: pd.DataFrame) -> str:
     results = search_products(query, df, top_k=3)
-    if not results.empty:
-        exact_urls = []
-        for _, row in results.iterrows():
-            url = str(row.get("url", "")).strip()
-            name = str(row.get("name", "")).strip()
-            if url:
-                exact_urls.append(f"- **{name}**\n{url}")
 
-        if exact_urls:
-            return "Ho trovato questi link prodotto pertinenti:\n\n" + "\n\n".join(exact_urls)
+    if results.empty:
+        msg = f"Ciao Emanuele, sto cercando questo prodotto ma non trovo il link preciso: {query}"
+        return (
+            "Non sono riuscito a trovare con certezza il prodotto esatto nel catalogo.\n\n"
+            f"Per verifica rapida scrivi direttamente a {WHATSAPP_LABEL} su WhatsApp:\n\n"
+            f"{whatsapp_link(msg)}"
+        )
+
+    with_url = results[results["url"].astype(str).str.strip() != ""].copy()
+
+    if with_url.empty:
+        msg = f"Ciao Emanuele, sto cercando il link del prodotto: {query}"
+        return (
+            "Ho trovato dei prodotti pertinenti, ma nel catalogo non vedo un link prodotto disponibile.\n\n"
+            + format_product_cards(results.head(3), show_links=False)
+            + f"\n\nPer avere il link corretto scrivi a {WHATSAPP_LABEL}:\n\n{whatsapp_link(msg)}"
+        )
+
+    if len(with_url) == 1:
+        row = with_url.iloc[0]
+        return (
+            f"Ho trovato il prodotto più pertinente:\n\n"
+            f"**{row.get('name', '')}**\n"
+            f"[Apri prodotto]({row.get('url', '')})"
+        )
 
     return (
-        "Non ho trovato un link prodotto preciso salvato in memoria.\n\n"
-        f"Per il link esatto ti consiglio di scrivere su WhatsApp:\n\n"
-        f"{whatsapp_link(f'Ciao, mi serve il link preciso di questo prodotto: {query}')}"
+        "Ho trovato questi prodotti pertinenti. Apri quello corretto:\n\n"
+        + format_product_cards(with_url.head(3), show_links=True)
     )
 
 
-def store_info_response(query: str, knowledge: str, memory: Dict[str, Any]) -> str:
-    faq_match = find_memory_faq(query, memory)
-    if faq_match:
-        return str(faq_match.get("answer", "")).strip()
+def store_info_response(query: str, knowledge: str) -> str:
+    manual = check_manual_faq(query)
+    if manual:
+        return manual
 
     if not knowledge.strip():
         return (
-            f"Per assistenza diretta ti consiglio di contattarci su WhatsApp:\n\n"
-            f"{whatsapp_link('Ciao, avrei bisogno di informazioni sul negozio.')}"
+            f"Per assistenza diretta ti consiglio di contattare {WHATSAPP_LABEL} su WhatsApp:\n\n"
+            f"{whatsapp_link('Ciao Emanuele, avrei bisogno di informazioni sul negozio.')}"
         )
 
     system_prompt = (
-        "Sei l'assistente clienti di MGFishing. "
-        "Usa SOLO le informazioni fornite. "
-        "Se l'informazione non è presente, invita a contattare WhatsApp. "
+        "Sei l'assistente clienti di MGFishing.\n"
+        "Rispondi usando SOLO le informazioni presenti nel testo fornito.\n"
+        "Riconosci anche domande formulate in modo diverso ma con lo stesso significato.\n"
+        "Se il testo contiene la risposta, rispondi in modo diretto e naturale.\n"
+        "Se il testo NON contiene la risposta, invita a contattare Emanuele su WhatsApp al 3494166335.\n"
         "Non inventare nulla."
     )
-    user_prompt = f"Knowledge:\n{knowledge}\n\nDomanda utente:\n{query}"
-    reply = ask_openai(system_prompt, user_prompt, temperature=0.1)
 
-    if not reply or "non riesco" in normalize_text(reply):
-        return (
-            f"Per questa informazione ti consiglio di contattarci su WhatsApp:\n\n"
-            f"{whatsapp_link(f'Ciao, avrei bisogno di informazioni su: {query}')}"
-        )
+    user_prompt = (
+        f"TESTO KNOWLEDGE:\n{knowledge}\n\n"
+        f"DOMANDA UTENTE:\n{query}"
+    )
+
+    reply = ask_openai(system_prompt, user_prompt, temperature=0.1)
     return reply
 
 
-def product_response(query: str, df: pd.DataFrame, memory: Dict[str, Any]) -> str:
-    memory_link = find_memory_product_link(query, memory)
-    if memory_link:
-        return f"Ho trovato il prodotto in memoria. Ecco il link corretto:\n\n{memory_link['url']}"
+def product_response(query: str, df: pd.DataFrame) -> str:
+    manual = check_manual_faq(query)
+    if manual:
+        return manual
 
     if df.empty:
         return (
             "Al momento non riesco a leggere il catalogo prodotti.\n\n"
-            f"Per un aiuto immediato puoi contattarci su WhatsApp:\n\n"
-            f"{whatsapp_link('Ciao, mi serve un consiglio su un prodotto.')}"
+            f"Per un aiuto immediato puoi contattare {WHATSAPP_LABEL} su WhatsApp:\n\n"
+            f"{whatsapp_link('Ciao Emanuele, mi serve un consiglio su un prodotto.')}"
         )
 
     results = search_products(query, df, top_k=5)
+
     if results.empty:
         return (
             "Non sono riuscito a trovare nel catalogo prodotti davvero pertinenti alla tua richiesta.\n\n"
-            f"Per un consiglio più preciso ti consiglio di contattarci su WhatsApp:\n\n"
-            f"{whatsapp_link(f'Ciao, sto cercando questo prodotto: {query}')}"
+            f"Per un consiglio più preciso ti consiglio di contattare {WHATSAPP_LABEL} su WhatsApp:\n\n"
+            f"{whatsapp_link(f'Ciao Emanuele, sto cercando questo prodotto: {query}')}"
         )
 
     catalog_context = []
@@ -584,89 +695,86 @@ def product_response(query: str, df: pd.DataFrame, memory: Dict[str, Any]) -> st
             "prezzo": row.get("price", ""),
             "categoria": row.get("category", ""),
             "marca": row.get("brand", ""),
-            "descrizione": row.get("description", ""),
-            "url": row.get("url", ""),
+            "descrizione": short_text(row.get("description", ""), 250),
+            "url": row.get("url", "")
         })
 
-    rules = memory.get("rules", [])
     system_prompt = (
-        "Sei un assistente esperto di pesca per MGFishing. "
-        "Devi consigliare SOLO prodotti presenti nel catalogo fornito. "
-        "Non inventare prodotti, categorie, marchi, prezzi o caratteristiche. "
-        "Se l'utente chiede un link e c'è un url nel catalogo, puoi riportarlo. "
-        "Se i risultati sono pochi o non perfetti, dillo con onestà. "
-        "Niente riferimenti esterni.\n\n"
-        f"Regole aggiuntive:\n- " + "\n- ".join(rules)
+        "Sei un assistente esperto di pesca per MGFishing.\n"
+        "Devi consigliare SOLO prodotti presenti nel catalogo fornito.\n"
+        "Non inventare prodotti, categorie, marchi, prezzi o caratteristiche.\n"
+        "Non proporre prodotti con prezzo 0.\n"
+        "Non proporre prodotti con categoria Home.\n"
+        "Non proporre prodotti poco pertinenti.\n"
+        "Se la richiesta parla di canne, non consigliare mulinelli salvo richiesta esplicita.\n"
+        "Se la richiesta parla di mulinelli, non consigliare canne salvo richiesta esplicita.\n"
+        "Se i risultati non sono perfetti, dichiaralo chiaramente.\n"
+        "Risposta chiara, commerciale, concreta.\n"
+        "Non citare fonti esterne.\n\n"
+        f"{memory_rules_text()}"
     )
+
     user_prompt = (
         f"Richiesta cliente: {query}\n\n"
         f"Prodotti trovati nel catalogo:\n{json.dumps(catalog_context, ensure_ascii=False, indent=2)}\n\n"
-        "Rispondi in modo chiaro, commerciale e utile."
+        "Consiglia solo prodotti davvero coerenti. Se uno non è coerente, ignoralo."
     )
-    return ask_openai(system_prompt, user_prompt, temperature=0.25)
+
+    reply = ask_openai(system_prompt, user_prompt, temperature=0.2)
+
+    cards = format_product_cards(results.head(3), show_links=False)
+    return f"{reply}\n\n---\n\n{cards}"
 
 
 def web_advice_response(query: str) -> str:
+    manual = check_manual_faq(query)
+    if manual:
+        return manual
+
     system_prompt = (
-        "Sei un assistente esperto di pesca di MGFishing. "
-        "Rispondi a domande su montature, tecniche, terminali, inneschi e consigli pratici. "
-        "Non citare siti esterni. Se mancano dati, dillo e dai comunque una linea guida utile."
+        "Sei un assistente esperto di pesca di MGFishing.\n"
+        "Rispondi a domande su montature, tecniche, terminali, inneschi, spot, orari e consigli pratici.\n"
+        "Non citare siti esterni o fonti esterne.\n"
+        "Se mancano dati come zona, specie o stagione, dillo e dai comunque una linea guida utile.\n\n"
+        f"{memory_rules_text()}"
     )
-    return ask_openai(system_prompt, f"Domanda cliente: {query}", temperature=0.35)
+    user_prompt = f"Domanda cliente: {query}"
+    return ask_openai(system_prompt, user_prompt, temperature=0.35)
 
 
-def detect_intent(query: str) -> str:
-    q = normalize_text(query)
-    if q in GREETING_WORDS:
-        return "greeting"
-    if contains_any(q, LINK_WORDS):
-        return "product_link"
-    if contains_any(q, STORE_INFO_WORDS):
-        return "store_info"
-    if contains_any(q, WEB_ADVICE_WORDS):
-        return "web_advice"
-    if contains_any(q, PRODUCT_HINTS):
-        return "product_advice"
-    return "generic"
-
-
-def generic_response(query: str, df: pd.DataFrame, knowledge: str, memory: Dict[str, Any]) -> str:
-    faq_match = find_memory_faq(query, memory)
-    if faq_match:
-        return str(faq_match.get("answer", "")).strip()
-
-    memory_link = find_memory_product_link(query, memory)
-    if memory_link:
-        return f"Ho trovato questo prodotto in memoria. Ecco il link corretto:\n\n{memory_link['url']}"
+def generic_response(query: str, df: pd.DataFrame, knowledge: str) -> str:
+    manual = check_manual_faq(query)
+    if manual:
+        return manual
 
     qn = normalize_text(query)
+
     if contains_any(qn, STORE_INFO_WORDS):
-        return store_info_response(query, knowledge, memory)
+        return store_info_response(query, knowledge)
 
     maybe_products = search_products(query, df, top_k=3)
-    if not maybe_products.empty:
-        return product_response(query, df, memory)
+    if not maybe_products.empty and contains_any(qn, PRODUCT_HINTS):
+        return product_response(query, df)
 
     return web_advice_response(query)
 
 
-def generate_response(query: str) -> str:
-    memory = load_memory(MEMORY_PATH)
-    knowledge = load_knowledge(KNOWLEDGE_PATH)
-    catalog = load_catalog(CSV_PATH)
+def generate_response(query: str, training_mode: bool = False) -> str:
     intent = detect_intent(query)
 
     if intent == "greeting":
         return greeting_response()
     if intent == "product_link":
-        return product_link_response(query, memory, catalog)
+        return product_link_response(query, catalog_df)
     if intent == "store_info":
-        return store_info_response(query, knowledge, memory)
+        return store_info_response(query, knowledge_text)
     if intent == "product_advice":
-        return product_response(query, catalog, memory)
+        return product_response(query, catalog_df)
     if intent == "web_advice":
         return web_advice_response(query)
-    return generic_response(query, catalog, knowledge, memory)
+
+    return generic_response(query, catalog_df, knowledge_text)
+
 
 # =========================================================
 # UI
@@ -674,64 +782,82 @@ def generate_response(query: str) -> str:
 st.markdown(
     """
     <style>
-    .main-title { font-size: 2.2rem; font-weight: 800; margin-bottom: 0.2rem; }
-    .subtitle { color: #666; margin-bottom: 1.2rem; }
+    .main-title {
+        font-size: 2.2rem;
+        font-weight: 800;
+        margin-bottom: 0.2rem;
+    }
+    .subtitle {
+        color: #666;
+        margin-bottom: 1.2rem;
+    }
+    .small-note {
+        font-size: 0.9rem;
+        color: #666;
+    }
     </style>
     """,
-    unsafe_allow_html=True,
+    unsafe_allow_html=True
 )
 
 st.markdown('<div class="main-title">🎣 MGFishing Chatbot</div>', unsafe_allow_html=True)
 st.markdown(
-    '<div class="subtitle">Chatbot base con memoria controllata da te</div>',
-    unsafe_allow_html=True,
+    '<div class="subtitle">Consigli prodotti, link prodotto, info negozio, montature e supporto training</div>',
+    unsafe_allow_html=True
 )
 
-if ADMIN_MODE:
-    with st.sidebar:
-        st.markdown("## Modalità Training")
-        st.caption("Questa modalità serve solo a te per insegnare nuovi link e risposte al bot.")
+ensure_memory_file()
 
-        with st.expander("Aggiungi link prodotto"):
-            product_name = st.text_input("Nome prodotto")
-            product_url = st.text_input("URL prodotto")
-            product_aliases = st.text_area("Alias separati da virgola", placeholder="xenos sw, trabucco xenos sw")
-            if st.button("Salva link prodotto"):
-                mem = load_memory(MEMORY_PATH)
-                mem["product_links"].append({
-                    "name": product_name.strip(),
-                    "url": product_url.strip(),
-                    "aliases": [x.strip() for x in product_aliases.split(",") if x.strip()],
-                })
-                save_memory(MEMORY_PATH, mem)
-                st.cache_data.clear()
-                st.success("Link prodotto salvato in memory.json")
+with st.sidebar:
+    st.header("Impostazioni")
+    training_mode = st.toggle("Training Mode", value=False)
+    if training_mode:
+        st.markdown("**Modalità training attiva**: le correzioni possono essere salvate.")
+    else:
+        st.markdown("**Modalità cliente**: il chatbot legge la memoria ma non impara.")
 
-        with st.expander("Aggiungi FAQ"):
-            faq_q = st.text_input("Domanda FAQ")
-            faq_a = st.text_area("Risposta FAQ")
-            if st.button("Salva FAQ"):
-                mem = load_memory(MEMORY_PATH)
-                mem["faq"].append({"question": faq_q.strip(), "answer": faq_a.strip()})
-                save_memory(MEMORY_PATH, mem)
-                st.cache_data.clear()
-                st.success("FAQ salvata in memory.json")
+    st.divider()
 
-        with st.expander("Aggiungi alias"):
-            alias_term = st.text_input("Termine principale")
-            alias_syn = st.text_area("Sinonimi separati da virgola")
-            if st.button("Salva alias"):
-                mem = load_memory(MEMORY_PATH)
-                mem["aliases"].append({
-                    "term": alias_term.strip(),
-                    "synonyms": [x.strip() for x in alias_syn.split(",") if x.strip()],
-                })
-                save_memory(MEMORY_PATH, mem)
-                st.cache_data.clear()
-                st.success("Alias salvato in memory.json")
+    st.subheader("Aggiungi Regola")
+    new_rule = st.text_area("Nuova regola globale", height=100, key="new_rule")
+    if st.button("Salva regola"):
+        if training_mode and new_rule.strip():
+            add_global_rule(new_rule)
+            st.success("Regola salvata in memory.json")
+        elif not training_mode:
+            st.warning("Attiva prima il Training Mode.")
 
-        with st.expander("Vedi memoria attuale"):
-            st.json(load_memory(MEMORY_PATH))
+    st.divider()
+
+    st.subheader("Salva FAQ Manuale")
+    faq_q = st.text_input("Domanda", key="faq_q")
+    faq_a = st.text_area("Risposta", height=120, key="faq_a")
+    if st.button("Salva FAQ"):
+        if training_mode and faq_q.strip() and faq_a.strip():
+            add_manual_faq(faq_q, faq_a)
+            st.success("FAQ salvata in memory.json")
+        elif not training_mode:
+            st.warning("Attiva prima il Training Mode.")
+
+    st.divider()
+
+    st.subheader("Salva Errore da Non Ripetere")
+    wrong_user_request = st.text_input("Richiesta utente errata", key="wrong_user_request")
+    wrong_reply = st.text_area("Risposta sbagliata del chatbot", height=120, key="wrong_reply")
+    wrong_lesson = st.text_area("Lezione / correzione", height=120, key="wrong_lesson")
+    if st.button("Salva errore"):
+        if training_mode and wrong_user_request.strip() and wrong_reply.strip() and wrong_lesson.strip():
+            add_training_note(wrong_user_request, wrong_reply, wrong_lesson)
+            st.success("Errore salvato in memory.json")
+        elif not training_mode:
+            st.warning("Attiva prima il Training Mode.")
+
+    st.divider()
+
+    if st.button("Ricarica catalogo"):
+        load_catalog.clear()
+        load_knowledge.clear()
+        st.success("Cache svuotata. Ricarica la pagina.")
 
 if "messages" not in st.session_state:
     st.session_state.messages = [
@@ -739,7 +865,8 @@ if "messages" not in st.session_state:
             "role": "assistant",
             "content": (
                 "Ciao! Sono l’assistente MGFishing 🎣\n\n"
-                "Posso aiutarti con prodotti, link, info negozio e consigli di pesca."
+                "Posso aiutarti con consigli sui prodotti, link prodotto, info su pagamenti e spedizioni, "
+                "montature e supporto pesca."
             ),
         }
     ]
@@ -757,7 +884,7 @@ if user_query:
 
     with st.chat_message("assistant"):
         with st.spinner("Sto elaborando la risposta..."):
-            answer = generate_response(user_query)
+            answer = generate_response(user_query, training_mode=training_mode)
             st.markdown(answer)
 
     st.session_state.messages.append({"role": "assistant", "content": answer})

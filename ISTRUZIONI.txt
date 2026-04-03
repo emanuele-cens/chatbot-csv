@@ -1,0 +1,6 @@
+1) Carica questi file su GitHub sostituendo quelli vecchi.
+2) Su Streamlit imposta la secret OPENAI_API_KEY.
+3) All'inizio lascia ADMIN_MODE = True dentro app.py.
+4) Parla tu col bot e usa la sidebar per salvare link, FAQ e alias.
+5) Quando hai finito il training, in app.py cambia ADMIN_MODE = False.
+6) Fai redeploy.

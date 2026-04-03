@@ -1,29 +1,6 @@
-MGFishing - Informazioni Negozio
+Benvenuto su MGFishing.
 
-Metodi di Pagamento:
-Sul nostro sito è possibile pagare tramite Carta, Paypal, Paypal in 3 o 4 rate, Rateizzato con Scalapay, Bonifico Bancario, Se preferisci effettuare un ordine tramite ricarica postepay scrivimi su whatsapp al 3494166335
-
-Tempi di spedizione:
-Spediamo in giornata tutti gli ordini che arrivano entro le 14:30. Gli ordini ricevuti dopo le 14:30 vengono spediti il primo giorno lavorativo successivo, La spedizione verrà consegnata in 24/48 ore Lavorative
-
-Costi di spedizione:
-La spedizione costa 9 euro in tutta Italia per ordini inferiori a 199 euro ed è gratuita per ordini sopra 199 euro.
-
-Corrieri utilizzati:
-Le spedizioni vengono affidate a corriere espresso. Utilizziamo Poste Italiane, SDA, Bartolini, TNT FedEx o UPS, scegliendo di volta in volta il corriere migliore in base alla zona di destinazione.
-
-Tracking ordine:
-Il tracking viene inviato via email all'indirizzo usato per effettuare l'ordine. Se il cliente non riesce a trovare il tracking o ha bisogno di assistenza, può scrivere su WhatsApp indicando il numero dell'ordine a questo link: [Scrivici su WhatsApp](https://wa.me/393494166335)
-
-Resi:
-Il reso è gratuito per articoli arrivati danneggiati. Eventuali problemi devono essere segnalati entro 48 ore dalla consegna. Consigliamo sempre di accettare il pacco con riserva di consegna.
-
-Assistenza clienti:
-Per assistenza clienti è disponibile WhatsApp a questo link: [Scrivici su WhatsApp](https://wa.me/393494166335)
-
-Contatti:
-Emanuele: 3494166335
-Giulio: 3408198180
-
-Note importanti:
-Per informazioni sui prodotti, il bot utilizza il catalogo caricato tramite file CSV. Per informazioni su spedizioni, tracking, resi e assistenza, il bot utilizza questo file di conoscenza.
+Informazioni negozio:
+- Per assistenza rapida puoi contattarci su WhatsApp.
+- Per ordini particolari, problemi o richieste specifiche il contatto diretto è consigliato.
+- Aggiorna questo file con le tue vere informazioni su spedizioni, pagamenti, resi e assistenza.

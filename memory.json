@@ -1,0 +1,47 @@
+{
+  "product_links": [
+    {
+      "name": "Trabucco Xenos SW",
+      "url": "",
+      "aliases": [
+        "xenos sw",
+        "trabucco xenos sw",
+        "mulinello trabucco xenos sw"
+      ]
+    }
+  ],
+  "faq": [
+    {
+      "question": "quali metodi di pagamento accettate",
+      "answer": "Puoi verificare i metodi di pagamento disponibili direttamente durante il checkout sul sito. Per un aiuto immediato puoi contattarci anche su WhatsApp."
+    },
+    {
+      "question": "in quanto spedite",
+      "answer": "Gli ordini vengono gestiti rapidamente. Per urgenze o richieste particolari puoi contattarci su WhatsApp."
+    }
+  ],
+  "rules": [
+    "Quando l'utente chiede un link prodotto, dare il link esatto del prodotto se presente in memory.json.",
+    "Non inventare mai link prodotto.",
+    "Se non trovi il prodotto preciso, non dare il link della categoria come se fosse il prodotto.",
+    "Per domande su ordini, problemi o casi particolari, invita a contattare WhatsApp.",
+    "Rispondi in modo semplice, utile e commerciale."
+  ],
+  "aliases": [
+    {
+      "term": "trota lago",
+      "synonyms": [
+        "tremarella",
+        "trout area",
+        "pesca trota lago"
+      ]
+    },
+    {
+      "term": "mulinello",
+      "synonyms": [
+        "reel",
+        "bobina"
+      ]
+    }
+  ]
+}
